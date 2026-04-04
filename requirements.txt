@@ -1,0 +1,2 @@
+cryptography>=42.0
+msgpack>=1.0

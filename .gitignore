@@ -1,0 +1,43 @@
+# TLS certificates — never commit private keys
+cert.pem
+key.pem
+
+# Node X25519 private keys — never commit
+secure_tunnel_keys/*.key
+
+# Environment config — contains AUTH_SECRET and VPS IPs
+.env
+
+# PyInstaller build artifacts
+build/
+dist/
+*.spec.bak
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Chrome profile (launcher creates this, large and personal)
+chrome_profile/
+
+# IDE
+.vscode/
+.idea/
+*.suo
+*.user
+
+# OS
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# Logs
+*.log

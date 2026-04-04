@@ -91,6 +91,11 @@ try:
 except ImportError:
     _HAS_TRAY = False
 
+from secure_tunnel.version import __version__ as APP_VERSION
+from secure_tunnel.ui.toast import notify as _toast_notify_fn
+from secure_tunnel.ui import kill_switch as _ks
+from secure_tunnel.ui.settings_dialog import open_settings_dialog as _open_settings_dialog
+
 # HTTP CONNECT proxy for all apps (Telegram, browsers, Steam, etc.)
 PROXY_ADDR = "http=127.0.0.1:8080;https=127.0.0.1:8080"
 PROXY_OVERRIDE = (
@@ -205,10 +210,6 @@ def _save_settings(base: Path, settings: dict) -> None:
 
 # ── Auto-update ───────────────────────────────────────────────────────────────
 
-from secure_tunnel.version import __version__ as APP_VERSION
-from secure_tunnel.ui.toast import notify as _toast_notify_fn
-from secure_tunnel.ui import kill_switch as _ks
-from secure_tunnel.ui.settings_dialog import open_settings_dialog as _open_settings_dialog
 _GITHUB_REPO = ""   # Set to "owner/repo" to enable auto-update checks
 
 

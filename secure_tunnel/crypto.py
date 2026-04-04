@@ -9,7 +9,11 @@ Key exchange: Hybrid Forward Secrecy
   alone does not break the session.  The wire is safe even if quantum computers
   crack X25519 in the future, or if a flaw is found in Kyber.
 
-Payload encryption: ChaCha20-Poly1305 (256-bit key, 96-bit nonce, 128-bit tag)
+Payload encryption: AES-256-GCM-SIV (nonce-misuse-resistant)
+  SIV construction: even if a 96-bit nonce is reused, the attacker only learns
+  that the same plaintext was sent twice — no key material is exposed.
+  XChaCha20-Poly1305 (192-bit nonce) was preferred but requires OpenSSL >= 3.x
+  bindings not yet exposed in the cryptography package.
 
 ML-KEM availability:
     Requires `cryptography` >= 43.0.0.
@@ -18,7 +22,7 @@ ML-KEM availability:
 """
 import secrets as _secrets
 
-from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305, AESGCMSIV
 from cryptography.hazmat.primitives.hashes import SHA256
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
@@ -99,14 +103,24 @@ def mlkem_decapsulate(priv, ciphertext: bytes) -> bytes | None:
 
 
 # ── Payload encryption ────────────────────────────────────────────────────────
+# AES-256-GCM-SIV: nonce-misuse-resistant AEAD.
+# Even if a random 96-bit nonce is accidentally reused, the SIV construction
+# only reveals that the same plaintext was sent twice — the session key and
+# all other plaintexts remain secure.  This is strictly stronger than plain
+# AES-GCM or ChaCha20-Poly1305 which catastrophically fail on nonce reuse.
+
+_NONCE_LEN = 12  # AES-GCM-SIV uses 96-bit nonces
+
 
 def encrypt_message(key: bytes, plaintext: bytes) -> bytes:
-    aead = ChaCha20Poly1305(key)
-    nonce = _secrets.token_bytes(12)
+    """Encrypt with AES-256-GCM-SIV. Returns nonce (12B) + ciphertext."""
+    aead = AESGCMSIV(key)
+    nonce = _secrets.token_bytes(_NONCE_LEN)
     return nonce + aead.encrypt(nonce, plaintext, None)
 
 
 def decrypt_message(key: bytes, data: bytes) -> bytes:
-    aead = ChaCha20Poly1305(key)
-    nonce, ciphertext = data[:12], data[12:]
+    """Decrypt AES-256-GCM-SIV frame. Raises InvalidTag on authentication failure."""
+    aead = AESGCMSIV(key)
+    nonce, ciphertext = data[:_NONCE_LEN], data[_NONCE_LEN:]
     return aead.decrypt(nonce, ciphertext, None)

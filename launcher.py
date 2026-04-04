@@ -92,7 +92,7 @@ except ImportError:
     _HAS_TRAY = False
 
 # HTTP CONNECT proxy for all apps (Telegram, browsers, Steam, etc.)
-PROXY_ADDR = "http=127.0.0.1:1081;https=127.0.0.1:1081"
+PROXY_ADDR = "http=127.0.0.1:8080;https=127.0.0.1:8080"
 PROXY_OVERRIDE = (
     "localhost;127.*;10.*;172.16.*;172.17.*;172.18.*;172.19.*;172.20.*;"
     "172.21.*;172.22.*;172.23.*;172.24.*;172.25.*;172.26.*;172.27.*;172.28.*;"
@@ -674,7 +674,7 @@ class Launcher:
         self._append("[launcher] Запуск SecureTunnel…\n", "info")
 
         # Kill any stale processes still holding node ports from a previous session
-        for port in (8765, 8766, 8767, 1080, 1081):
+        for port in (8765, 8766, 8767, 1080, 8080):
             self._kill_port(port)
 
         # Load or generate per-install AUTH_SECRET
@@ -952,7 +952,7 @@ class Launcher:
         if self._sys_proxy_on:
             self._sys_proxy_label.set("🔴  Системный прокси: ВКЛ")
             self.sysproxy_btn.config(bg="#1a5c1a")
-            self.log_line("[launcher] System proxy ENABLED — all apps now use 127.0.0.1:1081\n", "info")
+            self.log_line("[launcher] System proxy ENABLED — all apps now use 127.0.0.1:8080\n", "info")
         else:
             self._sys_proxy_label.set("⚪  Системный прокси: ВЫКЛ")
             self.sysproxy_btn.config(bg="#3a3a3a")

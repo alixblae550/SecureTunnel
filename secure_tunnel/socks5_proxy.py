@@ -4,15 +4,18 @@ Accepts browser connections on 127.0.0.1:1080 and routes each
 connection through the secure onion tunnel to the exit node.
 """
 import asyncio
+import os
 import socket
 import struct
 
 from secure_tunnel.tunnel_relay import relay_through_tunnel, relay_udp_through_tunnel, start_pool
+from secure_tunnel.logging.anon_logger import log_event
 
 SOCKS5_HOST = "127.0.0.1"
-SOCKS5_PORT = 1080
+SOCKS5_PORT = int(os.environ.get("SOCKS5_PORT", "1080"))
 
 _REPLY_FAIL    = b'\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00'
+_MAX_UDP_TASKS = 64   # cap concurrent UDP relay coroutines per relay socket
 _REPLY_REFUSED = b'\x05\x05\x00\x01\x00\x00\x00\x00\x00\x00'
 _REPLY_BADCMD  = b'\x05\x07\x00\x01\x00\x00\x00\x00\x00\x00'
 _REPLY_BADATYP = b'\x05\x08\x00\x01\x00\x00\x00\x00\x00\x00'
@@ -75,24 +78,32 @@ class _UDPRelay(asyncio.DatagramProtocol):
     def __init__(self):
         self.transport: asyncio.DatagramTransport | None = None
         self._client_addr: tuple | None = None
+        self._active_tasks: int = 0
 
     def connection_made(self, transport):
         self.transport = transport
 
     def datagram_received(self, data: bytes, addr: tuple):
         self._client_addr = addr
+        if self._active_tasks >= _MAX_UDP_TASKS:
+            log_event("socks5", 0, 0, 0, "udp_flood_drop")
+            return  # drop silently under UDP flood — no task spawned
+        self._active_tasks += 1
         asyncio.ensure_future(self._relay(data, addr))
 
     async def _relay(self, data: bytes, client_addr: tuple):
         try:
-            host, port, payload = _parse_udp_header(data)
-        except ValueError as e:
-            print(f"[socks5/udp] bad header: {e}")
-            return
-        print(f"[socks5/udp] relay {host}:{port} ({len(payload)}B)")
-        resp = await relay_udp_through_tunnel(host, port, payload)
-        if resp is not None and self.transport and not self.transport.is_closing():
-            self.transport.sendto(_build_udp_header(host, port) + resp, client_addr)
+            try:
+                host, port, payload = _parse_udp_header(data)
+            except ValueError as e:
+                log_event("socks5", 0, 0, 0, f"udp_bad_header:{type(e).__name__}")
+                return
+            log_event("socks5", 0, 0, len(payload), "udp_relay")
+            resp = await relay_udp_through_tunnel(host, port, payload)
+            if resp is not None and self.transport and not self.transport.is_closing():
+                self.transport.sendto(_build_udp_header(host, port) + resp, client_addr)
+        finally:
+            self._active_tasks -= 1
 
     def error_received(self, exc):
         pass
@@ -195,11 +206,11 @@ async def handle_socks5(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             await _handle_udp_associate(reader, writer)
             return
 
-        print(f"[socks5] {peer} -> {host}:{port}", flush=True)
+        log_event("socks5", 0, 0, port, "connect")
         try:
             await relay_through_tunnel(reader, writer, host, port)
         except Exception as tunnel_err:
-            print(f"[socks5] tunnel error for {host}:{port}: {tunnel_err}", flush=True)
+            log_event("socks5", 0, 0, 0, f"tunnel_error:{type(tunnel_err).__name__}")
             # relay_through_tunnel only closes writer when connect_ok;
             # here it failed before that — send error reply then close.
             try:
@@ -213,7 +224,7 @@ async def handle_socks5(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 pass
 
     except Exception as e:
-        print(f"[socks5] handshake error ({peer}): {e}", flush=True)
+        log_event("socks5", 0, 0, 0, f"handshake_error:{type(e).__name__}")
         try:
             writer.write(_REPLY_REFUSED)
             await writer.drain()

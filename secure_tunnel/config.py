@@ -41,9 +41,43 @@ ROUTE = [NODES["entry"], NODES["middle"], NODES["exit"]]
 # Shared secret for HMAC challenge-response inside TLS.
 # Change before deployment. Set AUTH_SECRET env var on each VPS.
 # Must be identical on all nodes and all clients.
-_auth_secret_raw = os.environ.get("AUTH_SECRET", "securetunnel-default-secret-CHANGE-ME")
-if _auth_secret_raw == "securetunnel-default-secret-CHANGE-ME":
-    print("[config] Running with default AUTH_SECRET (local mode)", flush=True)
+_DEFAULT_SECRET_SENTINEL = "securetunnel-default-secret-CHANGE-ME"
+_auth_secret_raw = os.environ.get("AUTH_SECRET", "")
+
+_is_local_run = all(
+    os.environ.get(k, "127.0.0.1") == "127.0.0.1"
+    for k in ("ENTRY_HOST", "MIDDLE_HOST", "EXIT_HOST")
+)
+
+if not _auth_secret_raw:
+    if _is_local_run:
+        # Local dev/test: use a stable generated secret stored next to the binary
+        _secret_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "auth_secret.key")
+        _secret_file = os.path.normpath(_secret_file)
+        if os.path.exists(_secret_file):
+            with open(_secret_file) as _f:
+                _auth_secret_raw = _f.read().strip()
+        else:
+            import secrets as _sec_gen
+            _auth_secret_raw = _sec_gen.token_hex(32)
+            try:
+                with open(_secret_file, "w") as _f:
+                    _f.write(_auth_secret_raw)
+                print(f"[config] Generated new AUTH_SECRET → {_secret_file}", flush=True)
+            except OSError:
+                pass
+        print("[config] Running with auto-generated AUTH_SECRET (local mode)", flush=True)
+    else:
+        # Production with remote nodes but no AUTH_SECRET set — this is dangerous
+        import sys
+        print(
+            "[config] FATAL: AUTH_SECRET env var is required when running with remote nodes.\n"
+            "         Set the same random secret on ALL nodes and the client:\n"
+            "         export AUTH_SECRET=$(python -c 'import secrets; print(secrets.token_hex(32))')",
+            flush=True,
+        )
+        sys.exit(1)
+
 AUTH_SECRET: bytes = _auth_secret_raw.encode()
 
 # Connections per IP per minute before silent drop
@@ -54,9 +88,9 @@ PROBE_TIMEOUT: float = float(os.environ.get("PROBE_TIMEOUT", "4.0"))
 
 # ── Connection pool ───────────────────────────────────────────────────────────
 # Number of pre-established connections in each pool (relay, entry, middle).
-POOL_SIZE: int = int(os.environ.get("POOL_SIZE", "12"))
+POOL_SIZE: int = max(1, min(100, int(os.environ.get("POOL_SIZE", "12"))))
 # Max simultaneous fresh connections being established at once.
-POOL_SEMAPHORE: int = int(os.environ.get("POOL_SEMAPHORE", "10"))
+POOL_SEMAPHORE: int = max(1, min(50, int(os.environ.get("POOL_SEMAPHORE", "10"))))
 
 # ── Timeouts ──────────────────────────────────────────────────────────────────
 # Timeout for CONNECT through relay → exit (seconds).

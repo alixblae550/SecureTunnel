@@ -39,7 +39,7 @@ from secure_tunnel.crypto import derive_session_key, mlkem_encapsulate
 from secure_tunnel.framing import build_frame, parse_frame
 from secure_tunnel.keyring import load_or_generate
 from secure_tunnel.logging.anon_logger import log_event
-from secure_tunnel.protocol import MSG_DATA, pack_plain, unpack_plain
+from secure_tunnel.protocol import MSG_DATA, pack_plain, unpack_plain, ReplayFilter
 
 _entry_cfg  = NODES["entry"]
 _middle_cfg = NODES["middle"]
@@ -246,6 +246,7 @@ async def handler(ws):
 
     relay_key  = derive_session_key(x25519_ss, mlkem_ss_)   # K1
     session_id = secrets.randbits(32)
+    relay_replay = ReplayFilter()   # per-session replay protection (relay→entry)
 
     reply: dict = {"pub": _entry_pub.public_bytes(Encoding.Raw, PublicFormat.Raw)}
     if mlkem_ct is not None:
@@ -268,7 +269,10 @@ async def handler(ws):
         except Exception as e:
             log_event(hop_id, session_id, 0, 0, f"parse_error:{e}")
             break
-        _, _, _, payload = unpack_plain(plain)
+        _, _, seq, payload = unpack_plain(plain)
+        if not relay_replay.accept(seq):
+            log_event(hop_id, session_id, 0, 0, f"replay_drop:seq={seq}")
+            continue
         obj = msgpack.unpackb(payload, raw=False)
         cmd = obj.get("cmd")
 
@@ -338,7 +342,10 @@ async def handler(ws):
     async for raw_frame in ws:
         try:
             plain     = parse_frame(relay_key, raw_frame)
-            _, _, _, payload = unpack_plain(plain)
+            _, _, seq, payload = unpack_plain(plain)
+            if not relay_replay.accept(seq):
+                log_event(hop_id, session_id, 0, 0, f"replay_drop:seq={seq}")
+                continue
             log_event(hop_id, session_id, MSG_DATA, len(payload), "in")
             fwd_frame = build_frame(middle_key,
                                     pack_plain(MSG_DATA, secrets.randbits(32), 0, payload))

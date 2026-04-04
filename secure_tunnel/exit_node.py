@@ -31,7 +31,7 @@ from secure_tunnel.keyring import load_or_generate
 from secure_tunnel.doh_resolver import resolve as doh_resolve
 from secure_tunnel.crypto import derive_session_key, mlkem_encapsulate
 from secure_tunnel.framing import build_frame, parse_frame
-from secure_tunnel.protocol import pack_plain, unpack_plain, MSG_DATA, MSG_COVER
+from secure_tunnel.protocol import pack_plain, unpack_plain, MSG_DATA, MSG_COVER, ReplayFilter
 from secure_tunnel.logging.anon_logger import log_event
 
 _exit_cfg = NODES["exit"]
@@ -72,12 +72,10 @@ async def _handle_udp(ws, obj: dict, send_cmd) -> None:
     sock = None
     try:
         ip = await asyncio.wait_for(doh_resolve(host), timeout=3.0)
-        # Support IPv6 UDP
         is_ipv6 = ":" in ip
         family = socket.AF_INET6 if is_ipv6 else socket.AF_INET
         sock = socket.socket(family, socket.SOCK_DGRAM)
         sock.setblocking(False)
-        # Fragment large UDP payloads (max UDP payload ~65507 bytes)
         if len(payload) > 65507:
             payload = payload[:65507]
         addr = (ip, port, 0, 0) if is_ipv6 else (ip, port)
@@ -87,11 +85,11 @@ async def _handle_udp(ws, obj: dict, send_cmd) -> None:
             timeout=_UDP_TIMEOUT,
         )
         resp_data = recv_data
-        print(f"[exit/udp] {host}:{port} — sent {len(payload)}B, recv {len(resp_data)}B")
+        log_event(NODE_NAME, 0, MSG_DATA, len(resp_data), "udp_resp")
     except asyncio.TimeoutError:
-        print(f"[exit/udp] timeout waiting for response from {host}:{port}")
+        log_event(NODE_NAME, 0, 0, 0, "udp_timeout")
     except Exception as e:
-        print(f"[exit/udp] error {host}:{port}: {type(e).__name__}: {e}")
+        log_event(NODE_NAME, 0, 0, 0, f"udp_error:{type(e).__name__}")
     finally:
         if sock is not None:
             try:
@@ -102,7 +100,7 @@ async def _handle_udp(ws, obj: dict, send_cmd) -> None:
     try:
         await ws.send(send_cmd({"cmd": "UDP_RESP", "id": uid, "data": resp_data}))
     except Exception as e:
-        print(f"[exit/udp] failed to send UDP_RESP: {e}")
+        log_event(NODE_NAME, 0, 0, 0, f"udp_resp_send_error:{type(e).__name__}")
 
 
 async def _handle_relay_handshake(ws, session_key: bytes, session_id: int,
@@ -156,13 +154,20 @@ async def handler(ws):
         reply["mlkem_ct"] = mlkem_ct_
     await ws.send(msgpack.packb(reply, use_bin_type=True))
 
+    _seq_out: list[int] = [0]
+    _in_filter = ReplayFilter()
+
     def _send_cmd(obj: dict) -> bytes:
         payload = msgpack.packb(obj, use_bin_type=True)
-        return build_frame(session_key, pack_plain(MSG_DATA, session_id, 0, payload))
+        frame = build_frame(session_key, pack_plain(MSG_DATA, session_id, _seq_out[0], payload))
+        _seq_out[0] = (_seq_out[0] + 1) & 0xFFFF_FFFF
+        return frame
 
     def _parse_cmd(raw_frame: bytes) -> dict:
         plain = parse_frame(session_key, raw_frame)
-        msg_type, _, _, payload = unpack_plain(plain)
+        msg_type, _, seq, payload = unpack_plain(plain)
+        if not _in_filter.accept(seq):
+            raise ValueError(f"replay_drop:seq={seq}")
         if msg_type == MSG_COVER:
             return {"cmd": "COVER"}
         return msgpack.unpackb(payload, raw=False)
@@ -198,16 +203,14 @@ async def handler(ws):
         # ── Connect to target ─────────────────────────────────────────────────
         try:
             ip = await asyncio.wait_for(doh_resolve(host), timeout=5.0)
-            print(f"[exit] DoH resolved {host} -> {ip}")
-            # Support both IPv4 and IPv6 addresses
             family = socket.AF_INET6 if ":" in ip else socket.AF_INET
             target_reader, target_writer = await asyncio.wait_for(
                 asyncio.open_connection(ip, port, family=family), timeout=10.0
             )
-            print(f"[exit] connected to {host}:{port}")
+            log_event(hop_id, session_id, MSG_DATA, 0, "connect_ok")
             await ws.send(_send_cmd({"cmd": "CONNECT_OK"}))
         except Exception as e:
-            print(f"[exit] cannot connect to {host}:{port}: {e}")
+            log_event(hop_id, session_id, 0, 0, f"connect_err:{type(e).__name__}")
             try:
                 await ws.send(_send_cmd({"cmd": "CONNECT_ERR", "msg": str(e)}))
             except Exception:
@@ -228,7 +231,7 @@ async def handler(ws):
             except (OSError, ConnectionResetError, BrokenPipeError):
                 pass
             except Exception as e:
-                print(f"[exit] target→tunnel error: {e}")
+                log_event("exit", session_id, 0, 0, f"target_tunnel_error:{type(e).__name__}")
             finally:
                 stop_event.set()
                 try:
@@ -256,12 +259,12 @@ async def handler(ws):
                         elif cmd == "CLOSE":
                             break
                     except Exception as e:
-                        print(f"[exit] tunnel→target parse error: {e}")
+                        log_event("exit", session_id, 0, 0, f"tunnel_parse_error:{type(e).__name__}")
                         break
             except (OSError, ConnectionResetError, BrokenPipeError):
                 pass
             except Exception as e:
-                print(f"[exit] tunnel→target error: {e}")
+                log_event("exit", session_id, 0, 0, f"tunnel_target_error:{type(e).__name__}")
             finally:
                 stop_event.set()
 

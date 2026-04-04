@@ -1,16 +1,17 @@
 """
-HTTP CONNECT proxy — listens on 127.0.0.1:1081.
+HTTP CONNECT proxy — listens on 127.0.0.1:8080 (configurable via HTTP_PORT env).
 Accepts HTTP CONNECT requests and tunnels them through the local SOCKS5 proxy
 (127.0.0.1:1080).  This makes the tunnel compatible with every Windows app
 that supports an HTTP proxy (Telegram, Edge, Discord, Steam, etc.).
 """
 import asyncio
+import os
 import struct
 
 LISTEN_HOST = "127.0.0.1"
-LISTEN_PORT = 1081
+LISTEN_PORT = int(os.environ.get("HTTP_PORT", "8080"))
 SOCKS5_HOST = "127.0.0.1"
-SOCKS5_PORT = 1080
+SOCKS5_PORT = int(os.environ.get("SOCKS5_PORT", "1080"))
 
 
 async def _socks5_connect(host: str, port: int) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:

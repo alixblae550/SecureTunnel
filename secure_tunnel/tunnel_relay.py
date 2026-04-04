@@ -36,7 +36,7 @@ from secure_tunnel.config import (
 from secure_tunnel.transport.tls_in_tls_transport import tls_in_tls_connect
 from secure_tunnel.crypto import derive_session_key, mlkem_generate, mlkem_decapsulate
 from secure_tunnel.framing import build_frame, parse_frame
-from secure_tunnel.protocol import pack_plain, unpack_plain, MSG_DATA, MSG_COVER
+from secure_tunnel.protocol import pack_plain, unpack_plain, MSG_DATA, MSG_COVER, ReplayFilter
 from secure_tunnel.circuit import CircuitManager
 from secure_tunnel.logging.anon_logger import log_event
 
@@ -264,14 +264,22 @@ def _return_to_pool(conn):
 # ---------------------------------------------------------------------------
 
 def _make_cmd_helpers(session_key, session_id):
+    _seq_out: list[int] = [0]          # mutable int in a list for nonlocal write
+    _in_filter = ReplayFilter()
+
     def _send_cmd(obj: dict) -> bytes:
         payload = msgpack.packb(obj, use_bin_type=True)
-        return build_frame(session_key, pack_plain(MSG_DATA, session_id, 0, payload))
+        frame = build_frame(session_key, pack_plain(MSG_DATA, session_id, _seq_out[0], payload))
+        _seq_out[0] = (_seq_out[0] + 1) & 0xFFFF_FFFF
+        return frame
 
     def _parse_cmd(raw_frame: bytes) -> tuple[int, dict]:
-        """Returns (msg_type, cmd_dict). For MSG_COVER frames, cmd_dict is {"cmd":"COVER"}."""
+        """Returns (msg_type, cmd_dict). For MSG_COVER frames, cmd_dict is {"cmd":"COVER"}.
+        Raises ValueError if the frame is a replay (duplicate seq_no)."""
         plain = parse_frame(session_key, raw_frame)
-        msg_type, _, _, payload = unpack_plain(plain)
+        msg_type, _, seq, payload = unpack_plain(plain)
+        if not _in_filter.accept(seq):
+            raise ValueError(f"replay_drop:seq={seq}")
         if msg_type == MSG_COVER:
             return MSG_COVER, {"cmd": "COVER"}
         return msg_type, msgpack.unpackb(payload, raw=False)
@@ -281,10 +289,11 @@ def _make_cmd_helpers(session_key, session_id):
         Receiver identifies cover frames by the message type field (MSG_COVER)
         in unpack_plain(), before attempting command parsing.
         """
-        # Pad with random extra bytes so cover frames vary in apparent size
         filler = os.urandom(secrets.randbelow(512) + 64)
         payload = msgpack.packb({"cmd": "COVER", "pad": filler}, use_bin_type=True)
-        return build_frame(session_key, pack_plain(MSG_COVER, session_id, 0, payload))
+        frame = build_frame(session_key, pack_plain(MSG_COVER, session_id, _seq_out[0], payload))
+        _seq_out[0] = (_seq_out[0] + 1) & 0xFFFF_FFFF
+        return frame
 
     return _send_cmd, _parse_cmd, _cover_frame
 

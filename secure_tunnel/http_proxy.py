@@ -150,8 +150,8 @@ def _exception_handler(loop: asyncio.AbstractEventLoop, context: dict) -> None:
 async def main() -> None:
     loop = asyncio.get_running_loop()
     loop.set_exception_handler(_exception_handler)
-    server = await asyncio.start_server(handle, LISTEN_HOST, LISTEN_PORT)
-    print(f"[http_proxy] listening on {LISTEN_HOST}:{LISTEN_PORT}")
+    server = await asyncio.start_server(handle, LISTEN_HOST, LISTEN_PORT, reuse_address=True)
+    print(f"[http_proxy] listening on {LISTEN_HOST}:{LISTEN_PORT}", flush=True)
     async with server:
         await server.serve_forever()
 

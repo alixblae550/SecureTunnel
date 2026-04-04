@@ -195,11 +195,13 @@ async def handle_socks5(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             await _handle_udp_associate(reader, writer)
             return
 
-        print(f"[socks5] {peer} -> {host}:{port}")
+        print(f"[socks5] {peer} -> {host}:{port}", flush=True)
         try:
             await relay_through_tunnel(reader, writer, host, port)
         except Exception as tunnel_err:
-            print(f"[socks5] tunnel error for {host}:{port}: {tunnel_err}")
+            import traceback
+            print(f"[socks5] tunnel error for {host}:{port}: {tunnel_err}", flush=True)
+            traceback.print_exc()
             # relay_through_tunnel only closes writer when connect_ok;
             # here it failed before that — send error reply then close.
             try:
@@ -213,7 +215,9 @@ async def handle_socks5(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 pass
 
     except Exception as e:
-        print(f"[socks5] handshake error ({peer}): {e}")
+        import traceback
+        print(f"[socks5] handshake error ({peer}): {e}", flush=True)
+        traceback.print_exc()
         try:
             writer.write(_REPLY_REFUSED)
             await writer.drain()
@@ -226,8 +230,8 @@ async def handle_socks5(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
 
 
 async def main():
-    server = await asyncio.start_server(handle_socks5, SOCKS5_HOST, SOCKS5_PORT)
-    print(f"[socks5] proxy listening on {SOCKS5_HOST}:{SOCKS5_PORT}")
+    server = await asyncio.start_server(handle_socks5, SOCKS5_HOST, SOCKS5_PORT, reuse_address=True)
+    print(f"[socks5] proxy listening on {SOCKS5_HOST}:{SOCKS5_PORT}", flush=True)
     async with server:
         await server.serve_forever()
 

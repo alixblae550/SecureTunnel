@@ -214,7 +214,7 @@ async def main():
         await asyncio.sleep(0.1)
 
     def _on_ready():
-        print(f"[node1] listening on {HOST}:{PORT} (TLS-in-TLS)")
+        print(f"[node1] listening on {HOST}:{PORT} (TLS-in-TLS)", flush=True)
 
     await tls_in_tls_serve(HOST, PORT, handler, cert=CERT, key=KEY, on_ready=_on_ready)
 

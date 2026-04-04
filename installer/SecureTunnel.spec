@@ -41,12 +41,21 @@ a = Analysis(
         'cryptography.hazmat.primitives.serialization',
         'cryptography.x509',
         'cryptography.x509.oid',
+        # ML-KEM (post-quantum) — available when cryptography is built against OpenSSL >= 3.5
+        # Safe to include: crypto.py catches ImportError and falls back to X25519-only
+        'cryptography.hazmat.primitives.asymmetric.mlkem',
         # Msgpack
         'msgpack',
         # Keyring (Windows backend)
         'keyring',
         'keyring.backends.Windows',
         'keyring.backends.fail',
+        # Tray icon
+        'pystray',
+        'pystray._win32',
+        'PIL',
+        'PIL.Image',
+        'PIL.ImageDraw',
         # Stdlib
         'tkinter',
         'tkinter.scrolledtext',

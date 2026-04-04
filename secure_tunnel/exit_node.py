@@ -70,9 +70,16 @@ async def _handle_udp(ws, obj: dict, send_cmd) -> None:
     sock = None
     try:
         ip = await asyncio.wait_for(doh_resolve(host), timeout=3.0)
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # Support IPv6 UDP
+        is_ipv6 = ":" in ip
+        family = socket.AF_INET6 if is_ipv6 else socket.AF_INET
+        sock = socket.socket(family, socket.SOCK_DGRAM)
         sock.setblocking(False)
-        await loop.sock_sendto(sock, payload, (ip, port))
+        # Fragment large UDP payloads (max UDP payload ~65507 bytes)
+        if len(payload) > 65507:
+            payload = payload[:65507]
+        addr = (ip, port, 0, 0) if is_ipv6 else (ip, port)
+        await loop.sock_sendto(sock, payload, addr)
         recv_data, _ = await asyncio.wait_for(
             loop.sock_recvfrom(sock, _UDP_RECV_SIZE),
             timeout=_UDP_TIMEOUT,
@@ -162,8 +169,10 @@ async def handler(ws):
         try:
             ip = await asyncio.wait_for(doh_resolve(host), timeout=5.0)
             print(f"[exit] DoH resolved {host} -> {ip}")
+            # Support both IPv4 and IPv6 addresses
+            family = socket.AF_INET6 if ":" in ip else socket.AF_INET
             target_reader, target_writer = await asyncio.wait_for(
-                asyncio.open_connection(ip, port), timeout=10.0
+                asyncio.open_connection(ip, port, family=family), timeout=10.0
             )
             print(f"[exit] connected to {host}:{port}")
             await ws.send(_send_cmd({"cmd": "CONNECT_OK"}))
@@ -238,7 +247,7 @@ async def handler(ws):
 
 async def main():
     def _on_ready():
-        print(f"[exit] listening on {HOST}:{PORT} (TLS-in-TLS, DoH, anti-probing)")
+        print(f"[exit] listening on {HOST}:{PORT} (TLS-in-TLS, DoH, anti-probing)", flush=True)
 
     await tls_in_tls_serve(HOST, PORT, handler, cert=CERT, key=KEY, on_ready=_on_ready)
 

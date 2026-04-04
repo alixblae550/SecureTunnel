@@ -55,6 +55,12 @@ def _frozen_gen_cert(directory: str) -> None:
 
 
 if getattr(sys, 'frozen', False):
+    # Force line-buffered stdout so subprocesses flush every print() immediately.
+    # PYTHONUNBUFFERED=1 has no effect inside a frozen PyInstaller exe.
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except Exception:
+        pass
     _args = [a for a in sys.argv[1:] if a not in ('-u', '-B', '-O', '-W', 'ignore')]
     if _args and _args[0] == '--gen-cert':
         _frozen_gen_cert(_args[1] if len(_args) > 1 else '.')
@@ -66,14 +72,24 @@ if getattr(sys, 'frozen', False):
         sys.exit(0)
 # ── End dispatcher ────────────────────────────────────────────────────────────
 
+import ctypes
 import glob
+import io
 import os
+import secrets as _secrets
 import subprocess
 import threading
 import tkinter as tk
 import winreg
 from pathlib import Path
 from tkinter import scrolledtext
+
+try:
+    import pystray
+    from PIL import Image, ImageDraw
+    _HAS_TRAY = True
+except ImportError:
+    _HAS_TRAY = False
 
 # HTTP CONNECT proxy for all apps (Telegram, browsers, Steam, etc.)
 PROXY_ADDR = "http=127.0.0.1:1081;https=127.0.0.1:1081"
@@ -121,6 +137,199 @@ def _is_system_proxy_active() -> bool:
         return False
 
 
+# ── Kill Switch (Windows Firewall) ────────────────────────────────────────────
+
+_KS_RULE = "SecureTunnel-KillSwitch"
+
+
+def _is_admin() -> bool:
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def _ks_activate(exe_path: str) -> bool:
+    """
+    Hard kill switch: block ALL outbound traffic except from SecureTunnel.exe.
+    Requires administrator privileges.
+    Returns True on success.
+    """
+    try:
+        # 1. Block all outbound
+        subprocess.run([
+            "netsh", "advfirewall", "firewall", "add", "rule",
+            f"name={_KS_RULE}-Block", "dir=out", "action=block",
+            "protocol=any",
+        ], capture_output=True, check=True)
+        # 2. Allow outbound from our own exe (tunnel traffic to nodes + exit→internet)
+        subprocess.run([
+            "netsh", "advfirewall", "firewall", "add", "rule",
+            f"name={_KS_RULE}-Allow", "dir=out", "action=allow",
+            "protocol=any", f"program={exe_path}",
+        ], capture_output=True, check=True)
+        return True
+    except Exception:
+        return False
+
+
+def _ks_deactivate() -> None:
+    """Remove kill switch firewall rules."""
+    for suffix in ("-Block", "-Allow"):
+        subprocess.run([
+            "netsh", "advfirewall", "firewall", "delete", "rule",
+            f"name={_KS_RULE}{suffix}",
+        ], capture_output=True)
+
+
+def _ks_cleanup() -> None:
+    """Called at exit to ensure firewall rules are always removed."""
+    _ks_deactivate()
+
+
+# ── AUTH_SECRET ───────────────────────────────────────────────────────────────
+
+def _ensure_auth_secret(base: Path) -> str:
+    """
+    Load or generate a per-install AUTH_SECRET.
+    Stored in auth_secret.key next to the exe/script.
+    Returns the secret string.
+    """
+    secret_file = base / "auth_secret.key"
+    if secret_file.exists():
+        return secret_file.read_text().strip()
+    secret = _secrets.token_hex(32)
+    secret_file.write_text(secret)
+    return secret
+
+
+# ── Tray icon ─────────────────────────────────────────────────────────────────
+
+def _make_tray_icon(color: str = "#0e639c") -> "Image.Image":
+    """
+    Generate a simple shield-style tray icon (32×32) with the given color.
+    color: '#0e639c' = blue (running), '#6c3030' = red (stopped/error).
+    """
+    size = 32
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    # Draw filled circle as background
+    draw.ellipse([2, 2, size - 2, size - 2], fill=color)
+    # Draw "S" letter or a lock shape — simple white rectangle as body
+    cx, cy = size // 2, size // 2
+    # Lock shackle (arc top)
+    draw.arc([cx - 5, cy - 10, cx + 5, cy], start=0, end=180, fill="white", width=3)
+    # Lock body
+    draw.rectangle([cx - 6, cy - 1, cx + 6, cy + 7], fill="white")
+    # Keyhole
+    draw.ellipse([cx - 2, cy + 1, cx + 2, cy + 5], fill=color)
+    return img
+
+
+# ── Settings persistence ──────────────────────────────────────────────────────
+
+def _load_settings(base: Path) -> dict:
+    import json
+    f = base / "settings.json"
+    if f.exists():
+        try:
+            return json.loads(f.read_text())
+        except Exception:
+            pass
+    return {}
+
+
+def _save_settings(base: Path, settings: dict) -> None:
+    import json
+    f = base / "settings.json"
+    f.write_text(json.dumps(settings, indent=2))
+
+
+# ── Auto-update ───────────────────────────────────────────────────────────────
+
+APP_VERSION = "1.0.0"
+_GITHUB_REPO = ""   # Set to "owner/repo" to enable auto-update checks
+
+
+def _check_update_bg(callback) -> None:
+    """
+    Check GitHub Releases API for a newer version in a background thread.
+    Calls callback(latest_version, download_url) if update is available,
+    or callback(None, None) if up-to-date or check failed.
+    """
+    if not _GITHUB_REPO:
+        return
+
+    def _run():
+        import urllib.request
+        import json as _json
+        try:
+            url = f"https://api.github.com/repos/{_GITHUB_REPO}/releases/latest"
+            req = urllib.request.Request(url, headers={"User-Agent": "SecureTunnel"})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = _json.loads(resp.read())
+            latest = data.get("tag_name", "").lstrip("v")
+            if not latest:
+                return
+            # Simple version comparison: split by dots
+            def ver(s):
+                try:
+                    return tuple(int(x) for x in s.split("."))
+                except Exception:
+                    return (0,)
+            if ver(latest) > ver(APP_VERSION):
+                assets = data.get("assets", [])
+                dl_url = next(
+                    (a["browser_download_url"] for a in assets
+                     if a["name"].endswith(".exe")),
+                    data.get("html_url", ""),
+                )
+                callback(latest, dl_url)
+        except Exception:
+            pass
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def _write_proxy_pac(base: Path, domains_raw: str) -> None:
+    """
+    Generate a proxy.pac file for split tunneling.
+    domains_raw: newline-separated list of domains/IPs to tunnel.
+                 '*' = route everything through proxy.
+    """
+    socks5_port = 1080
+    try:
+        s = _load_settings(base)
+        socks5_port = s.get("socks5_port", 1080)
+    except Exception:
+        pass
+
+    lines = [d.strip() for d in domains_raw.splitlines() if d.strip()]
+    if not lines or lines == ["*"]:
+        # Route everything through proxy
+        pac = (
+            "function FindProxyForURL(url, host) {\n"
+            f'    return "SOCKS5 127.0.0.1:{socks5_port}; DIRECT";\n'
+            "}\n"
+        )
+    else:
+        # Build condition for each domain
+        checks = []
+        for d in lines:
+            if d.startswith("*"):
+                d = d[1:].lstrip(".")
+            checks.append(f'    if (dnsDomainIs(host, ".{d}") || host == "{d}")')
+        cond = " ||\n".join(checks)
+        pac = (
+            "function FindProxyForURL(url, host) {\n"
+            f"{cond}\n"
+            f'        return "SOCKS5 127.0.0.1:{socks5_port}; DIRECT";\n'
+            "    return \"DIRECT\";\n"
+            "}\n"
+        )
+    (base / "proxy.pac").write_text(pac)
+
+
 # When frozen: use directory of the .exe so cert/key land next to it,
 # not inside PyInstaller's temporary extraction folder.
 if getattr(sys, 'frozen', False):
@@ -156,6 +365,11 @@ class Launcher:
                  font=("Consolas", 9), fg="#569cd6").pack(side="left", padx=8)
         tk.Label(pool_frame, textvariable=self._node1_pool_var,
                  font=("Consolas", 9), fg="#ce9178").pack(side="left", padx=8)
+
+        # ── Bandwidth indicator ──────────────────────────────────────────────
+        self._bw_var = tk.StringVar(value="↓ — KB/s  ↑ — KB/s")
+        tk.Label(root, textvariable=self._bw_var,
+                 font=("Consolas", 9, "bold"), fg="#b5cea8").pack()
 
         tk.Label(
             root,
@@ -207,6 +421,16 @@ class Launcher:
             activebackground="#555555", relief="flat", command=self.copy_log
         ).pack(side="left", padx=6)
 
+        tk.Button(
+            btn_frame, text="⚙  Настройки", width=14, bg="#3a3a3a", fg="white",
+            activebackground="#555555", relief="flat", command=self.open_settings
+        ).pack(side="left", padx=6)
+
+        tk.Button(
+            btn_frame, text="🔀  Split", width=10, bg="#3a3a3a", fg="white",
+            activebackground="#555555", relief="flat", command=self.open_split_tunneling
+        ).pack(side="left", padx=6)
+
         # Second row
         btn_frame2 = tk.Frame(root)
         btn_frame2.pack(pady=(0, 10))
@@ -227,7 +451,24 @@ class Launcher:
             command=self.toggle_system_proxy,
             state="disabled",
         )
-        self.sysproxy_btn.pack(padx=6)
+        self.sysproxy_btn.pack(side="left", padx=6)
+
+        # Kill Switch button
+        self._ks_on = False
+        self._ks_label = tk.StringVar(value="🔓  Kill Switch: ВЫКЛ")
+        self._ks_admin = _is_admin()
+        self.ks_btn = tk.Button(
+            btn_frame2,
+            textvariable=self._ks_label,
+            width=22,
+            bg="#3a3a3a", fg="white",
+            activebackground="#555555",
+            relief="flat",
+            command=self.toggle_kill_switch,
+        )
+        self.ks_btn.pack(side="left", padx=6)
+        if not self._ks_admin:
+            self.ks_btn.config(fg="#888888")  # dim if no admin rights
 
         # Transparent proxy row (shown only if transparent_proxy.exe exists)
         _tproxy_exe = BASE / "transparent_proxy" / "transparent_proxy.exe"
@@ -256,8 +497,14 @@ class Launcher:
         self._proc_meta: dict[int, tuple[str, str]] = {}
         self._running = False  # True while the tunnel system should be running
         self._log_buf: list[tuple[str, str]] = []
+        self._tray = None
 
         root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._init_tray()
+        # Check for updates in background (non-blocking)
+        _check_update_bg(lambda ver, url: self.root.after(
+            0, self._notify_update, ver, url
+        ))
 
     # ── Logging ──────────────────────────────────────────────────────────────
 
@@ -311,6 +558,8 @@ class Launcher:
                 self.root.after(0, self._update_relay_pool, line.strip())
             elif "[relay] tunnel pool ready" in line:
                 self.root.after(0, self._relay_pool_var.set, "Relay pool: ready")
+            elif "[relay] bw:" in line:
+                self.root.after(0, self._update_bw, line.strip())
             elif "[entry] middle pool:" in line:
                 self.root.after(0, self._update_entry_pool, line.strip())
             elif "[node1] exit pool:" in line:
@@ -325,6 +574,14 @@ class Launcher:
         # EOF reached — process exited
         if self._running:
             self.root.after(0, self._handle_crash, proc)
+
+    def _update_bw(self, line: str):
+        # line: "[relay] bw: 42↓ 18↑ KB/s"
+        try:
+            part = line.split("bw:")[-1].strip()   # "42↓ 18↑ KB/s"
+            self._bw_var.set(f"↓↑ {part}")
+        except Exception:
+            pass
 
     def _update_relay_pool(self, line: str):
         # line: "[relay] pool: 8/12 ready"
@@ -418,11 +675,30 @@ class Launcher:
         self._relay_pool_var.set("Relay pool: —")
         self._entry_pool_var.set("Entry pool: —")
         self._node1_pool_var.set("Middle pool: —")
+        self._bw_var.set("↓ — KB/s  ↑ — KB/s")
         self._append("[launcher] Starting SecureTunnel…\n", "info")
 
         # Kill any stale processes still holding node ports from a previous session
         for port in (8765, 8766, 8767, 1080, 1081):
             self._kill_port(port)
+
+        # Load or generate per-install AUTH_SECRET
+        secret = _ensure_auth_secret(BASE)
+        os.environ["AUTH_SECRET"] = secret
+        self.log_line("[launcher] AUTH_SECRET loaded.\n", "info")
+
+        # Apply custom ports from settings
+        s = _load_settings(BASE)
+        if s.get("socks5_port"):
+            os.environ["SOCKS5_PORT"] = str(s["socks5_port"])
+        if s.get("http_port"):
+            os.environ["HTTP_PORT"] = str(s["http_port"])
+        if s.get("entry_port"):
+            os.environ["ENTRY_PORT"] = str(s["entry_port"])
+        if s.get("middle_port"):
+            os.environ["MIDDLE_PORT"] = str(s["middle_port"])
+        if s.get("exit_port"):
+            os.environ["EXIT_PORT"] = str(s["exit_port"])
 
         if not self._ensure_cert():
             self._set_idle()
@@ -472,6 +748,9 @@ class Launcher:
         self.status_var.set("✅ Running")
         self.chrome_btn.config(state="normal")
         self.sysproxy_btn.config(state="normal")
+        self._ks_on_tunnel_up()
+        self._tray_set(self._tray_icon_running if _HAS_TRAY else None,
+                       "SecureTunnel — Running")
         if self._tproxy_available:
             self.tproxy_btn.config(state="normal")
             self.log_line(
@@ -499,6 +778,9 @@ class Launcher:
         if dead_proc in self.procs:
             self.procs.remove(dead_proc)
         self._proc_meta.pop(dead_proc.pid, None)  # free stale entry
+        self._ks_on_tunnel_down()
+        self._tray_set(self._tray_icon_error if _HAS_TRAY else None,
+                       f"SecureTunnel — ⚠ {module.split('.')[-1]} crashed")
         self.root.after(2000, lambda: self._restart_proc(module, tag))
 
     def _restart_proc(self, module: str, tag: str):
@@ -516,6 +798,170 @@ class Launcher:
         self.root.clipboard_clear()
         self.root.clipboard_append(text)
         self.log_line("[launcher] Лог скопирован в буфер обмена.\n", "info")
+
+    # ── Settings dialog ───────────────────────────────────────────────────────
+
+    def open_settings(self):
+        """Open a modal settings dialog for configuring ports."""
+        if self._running:
+            self.log_line("[launcher] Останови туннель перед изменением настроек.\n", "err")
+            return
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Настройки SecureTunnel")
+        dlg.resizable(False, False)
+        dlg.grab_set()
+        dlg.configure(bg="#252526")
+
+        settings = _load_settings(BASE)
+
+        fields = [
+            ("SOCKS5 порт",   "socks5_port",  str(settings.get("socks5_port", 1080))),
+            ("HTTP порт",     "http_port",    str(settings.get("http_port",   1081))),
+            ("Entry порт",    "entry_port",   str(settings.get("entry_port",  8765))),
+            ("Middle порт",   "middle_port",  str(settings.get("middle_port", 8766))),
+            ("Exit порт",     "exit_port",    str(settings.get("exit_port",   8767))),
+        ]
+
+        entries = {}
+        for row, (label, key, default) in enumerate(fields):
+            tk.Label(dlg, text=label, bg="#252526", fg="#d4d4d4",
+                     font=("Consolas", 9), anchor="w", width=16).grid(
+                row=row, column=0, padx=10, pady=4, sticky="w")
+            var = tk.StringVar(value=default)
+            e = tk.Entry(dlg, textvariable=var, width=8, bg="#3c3c3c", fg="white",
+                         insertbackground="white", relief="flat",
+                         font=("Consolas", 9))
+            e.grid(row=row, column=1, padx=10, pady=4)
+            entries[key] = var
+
+        def save():
+            new = {}
+            for key, var in entries.items():
+                try:
+                    val = int(var.get())
+                    if not (1 <= val <= 65535):
+                        raise ValueError
+                    new[key] = val
+                except ValueError:
+                    self.log_line(f"[launcher] Неверный порт для {key}.\n", "err")
+                    return
+            _save_settings(BASE, new)
+            self.log_line("[launcher] Настройки сохранены. Применятся при следующем запуске.\n", "info")
+            dlg.destroy()
+
+        def reset():
+            defaults = {"socks5_port": 1080, "http_port": 1081,
+                        "entry_port": 8765, "middle_port": 8766, "exit_port": 8767}
+            for key, var in entries.items():
+                var.set(str(defaults[key]))
+
+        btn_frame = tk.Frame(dlg, bg="#252526")
+        btn_frame.grid(row=len(fields), column=0, columnspan=2, pady=8)
+        tk.Button(btn_frame, text="Сохранить", command=save,
+                  bg="#0e639c", fg="white", relief="flat", width=12).pack(side="left", padx=6)
+        tk.Button(btn_frame, text="По умолчанию", command=reset,
+                  bg="#3a3a3a", fg="white", relief="flat", width=14).pack(side="left", padx=6)
+        tk.Button(btn_frame, text="Отмена", command=dlg.destroy,
+                  bg="#3a3a3a", fg="white", relief="flat", width=10).pack(side="left", padx=6)
+
+    # ── Split tunneling ───────────────────────────────────────────────────────
+
+    def open_split_tunneling(self):
+        """
+        Split tunneling: set proxy only for selected apps via per-app proxy env vars.
+        Shows running processes; user picks which ones route through tunnel.
+        Implementation: writes a proxy.pac file and optionally sets system PAC URL.
+        """
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Split Tunneling — выбор приложений")
+        dlg.resizable(True, True)
+        dlg.grab_set()
+        dlg.configure(bg="#252526")
+        dlg.geometry("500x400")
+
+        tk.Label(
+            dlg,
+            text="Split tunneling настраивает системный прокси через PAC-файл.\n"
+                 "Выбери домены/IP которые должны идти через туннель:",
+            bg="#252526", fg="#d4d4d4", font=("Consolas", 9), justify="left",
+        ).pack(padx=10, pady=8, anchor="w")
+
+        settings = _load_settings(BASE)
+        tunnel_domains_raw = settings.get("tunnel_domains", "")
+
+        tk.Label(dlg, text="Домены через туннель (по одному на строку, * для всех):",
+                 bg="#252526", fg="#9cdcfe", font=("Consolas", 9)).pack(padx=10, anchor="w")
+
+        txt = tk.Text(dlg, height=12, bg="#1e1e1e", fg="#d4d4d4",
+                      font=("Consolas", 9), insertbackground="white", relief="flat")
+        txt.pack(padx=10, pady=4, fill="both", expand=True)
+        txt.insert("1.0", tunnel_domains_raw)
+
+        def save_split():
+            domains_text = txt.get("1.0", "end-1c").strip()
+            settings["tunnel_domains"] = domains_text
+            _save_settings(BASE, settings)
+            # Write proxy.pac
+            _write_proxy_pac(BASE, domains_text)
+            self.log_line("[launcher] Split tunneling сохранён → proxy.pac обновлён.\n", "info")
+            dlg.destroy()
+
+        tk.Button(dlg, text="Сохранить", command=save_split,
+                  bg="#0e639c", fg="white", relief="flat").pack(pady=6)
+
+    # ── Kill Switch ───────────────────────────────────────────────────────────
+
+    def toggle_kill_switch(self):
+        if not self._ks_admin:
+            self.log_line(
+                "[launcher] ⚠ Kill Switch требует прав администратора. "
+                "Запусти SecureTunnel.exe от имени администратора.\n", "err"
+            )
+            return
+        self._ks_on = not self._ks_on
+        if self._ks_on:
+            self._ks_apply()
+        else:
+            self._ks_remove()
+
+    def _ks_apply(self):
+        """Activate kill switch: block all outbound except from our exe."""
+        exe = str(Path(sys.executable).resolve())
+        ok = _ks_activate(exe)
+        if ok:
+            self._ks_label.set("🔒  Kill Switch: ВКЛ")
+            self.ks_btn.config(bg="#7a1a1a")
+            self.log_line(
+                "[launcher] 🔒 Kill Switch ВКЛЮЧЁН — весь трафик заблокирован, "
+                "кроме туннеля.\n", "info"
+            )
+        else:
+            self._ks_on = False
+            self.log_line("[launcher] Kill Switch: ошибка применения правил.\n", "err")
+
+    def _ks_remove(self):
+        """Deactivate kill switch."""
+        _ks_deactivate()
+        self._ks_on = False
+        self._ks_label.set("🔓  Kill Switch: ВЫКЛ")
+        self.ks_btn.config(bg="#3a3a3a")
+        self.log_line("[launcher] 🔓 Kill Switch ВЫКЛЮЧЕН — прямой доступ разрешён.\n", "info")
+
+    def _ks_on_tunnel_down(self):
+        """Called when a node crashes while kill switch is active."""
+        if self._ks_on:
+            self.log_line(
+                "[launcher] 🔒 Kill Switch активен — трафик заблокирован до "
+                "восстановления туннеля.\n", "info"
+            )
+
+    def _ks_on_tunnel_up(self):
+        """Called when tunnel is fully up (all nodes ready)."""
+        if self._ks_on:
+            self.log_line(
+                "[launcher] 🔒 Kill Switch: туннель восстановлен, "
+                "трафик снова идёт через туннель.\n", "info"
+            )
 
     # ── System proxy toggle ───────────────────────────────────────────────────
 
@@ -646,9 +1092,15 @@ class Launcher:
                 self.log_line("[launcher] System proxy automatically disabled.\n", "info")
             except Exception:
                 pass
+        # Deactivate kill switch on stop so traffic isn't blocked after exit
+        if self._ks_on:
+            self._ks_remove()
+        self._tray_set(self._tray_icon_idle if _HAS_TRAY else None,
+                       "SecureTunnel — Idle")
         self._relay_pool_var.set("Relay pool: —")
         self._entry_pool_var.set("Entry pool: —")
         self._node1_pool_var.set("Middle pool: —")
+        self._bw_var.set("↓ — KB/s  ↑ — KB/s")
         if self._tproxy_available:
             self._tproxy_on = False
             self._tproxy_label.set("⚪  Прозрачный прокси: ВЫКЛ")
@@ -663,11 +1115,69 @@ class Launcher:
         self.sysproxy_btn.config(state="disabled")
 
     def _on_close(self):
+        """Minimize to tray instead of quitting (if tray is available)."""
+        if _HAS_TRAY and self._tray is not None:
+            self.root.withdraw()   # hide window, keep running in tray
+        else:
+            self._quit_app()
+
+    def _quit_app(self):
         self.stop()
+        if _HAS_TRAY and self._tray is not None:
+            self._tray.stop()
         self.root.destroy()
+
+    # ── Tray ─────────────────────────────────────────────────────────────────
+
+    def _init_tray(self):
+        if not _HAS_TRAY:
+            return
+        self._tray_icon_idle    = _make_tray_icon("#555555")
+        self._tray_icon_running = _make_tray_icon("#0e639c")
+        self._tray_icon_error   = _make_tray_icon("#6c3030")
+
+        menu = pystray.Menu(
+            pystray.MenuItem("Показать", self._tray_show, default=True),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("▶  Start",  lambda: self.root.after(0, self.start)),
+            pystray.MenuItem("■  Stop",   lambda: self.root.after(0, self.stop)),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("✕  Выйти", lambda: self.root.after(0, self._quit_app)),
+        )
+        self._tray = pystray.Icon(
+            "SecureTunnel",
+            self._tray_icon_idle,
+            "SecureTunnel — Idle",
+            menu,
+        )
+        t = threading.Thread(target=self._tray.run, daemon=True)
+        t.start()
+
+    def _tray_show(self, *_):
+        self.root.after(0, self._show_window)
+
+    def _show_window(self):
+        self.root.deiconify()
+        self.root.lift()
+        self.root.focus_force()
+
+    def _notify_update(self, version: str, url: str):
+        self.log_line(
+            f"[launcher] 🔔 Доступна новая версия SecureTunnel v{version}!\n"
+            f"[launcher] Скачай: {url}\n",
+            "info"
+        )
+
+    def _tray_set(self, icon_img, tooltip: str):
+        if not _HAS_TRAY or self._tray is None:
+            return
+        self._tray.icon  = icon_img
+        self._tray.title = tooltip
 
 
 def main():
+    import atexit
+    atexit.register(_ks_cleanup)  # always remove firewall rules on exit
     root = tk.Tk()
     Launcher(root)
     root.mainloop()

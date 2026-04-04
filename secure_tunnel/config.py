@@ -43,12 +43,7 @@ ROUTE = [NODES["entry"], NODES["middle"], NODES["exit"]]
 # Must be identical on all nodes and all clients.
 _auth_secret_raw = os.environ.get("AUTH_SECRET", "securetunnel-default-secret-CHANGE-ME")
 if _auth_secret_raw == "securetunnel-default-secret-CHANGE-ME":
-    import warnings
-    warnings.warn(
-        "AUTH_SECRET is set to the default value. Set the AUTH_SECRET environment "
-        "variable to a strong random secret before deployment.",
-        stacklevel=2,
-    )
+    print("[config] Running with default AUTH_SECRET (local mode)", flush=True)
 AUTH_SECRET: bytes = _auth_secret_raw.encode()
 
 # Connections per IP per minute before silent drop

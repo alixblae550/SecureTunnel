@@ -31,10 +31,15 @@ _DEFAULT_TTL = 300.0  # 5 minutes
 _inflight: dict[str, "asyncio.Future[str]"] = {}
 
 _IPV4_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
+_IPV6_RE = re.compile(r"^[0-9a-fA-F:]+$")
 
 
-async def _query_doh(hostname: str) -> tuple[str, float]:
-    """Async DoH query using asyncio SSL streams — zero thread overhead."""
+async def _query_doh_type(hostname: str, qtype: str) -> tuple[str, float] | None:
+    """
+    Query DoH for a specific record type ('A' or 'AAAA').
+    Returns (ip, ttl) or None on failure.
+    """
+    dns_type = 1 if qtype == "A" else 28  # A=1, AAAA=28
     for host, path in _DOH_PROVIDERS:
         try:
             reader, writer = await asyncio.wait_for(
@@ -43,15 +48,13 @@ async def _query_doh(hostname: str) -> tuple[str, float]:
             )
             try:
                 request = (
-                    f"GET {path}?name={hostname}&type=A HTTP/1.1\r\n"
+                    f"GET {path}?name={hostname}&type={qtype} HTTP/1.1\r\n"
                     f"Host: {host}\r\n"
                     f"Accept: application/dns-json\r\n"
                     f"Connection: close\r\n\r\n"
                 )
                 writer.write(request.encode())
                 await writer.drain()
-
-                # Read until EOF (response is small, usually one packet)
                 raw = b""
                 while True:
                     chunk = await asyncio.wait_for(reader.read(8192), timeout=5.0)
@@ -67,19 +70,32 @@ async def _query_doh(hostname: str) -> tuple[str, float]:
                 except Exception:
                     pass
 
-            # Strip HTTP headers
             sep = raw.find(b"\r\n\r\n")
             if sep == -1:
                 continue
             body = raw[sep + 4:]
             data = json.loads(body)
-            answers = [r for r in data.get("Answer", []) if r.get("type") == 1]
+            answers = [r for r in data.get("Answer", []) if r.get("type") == dns_type]
             if answers:
                 ip = answers[0]["data"]
                 ttl = float(answers[0].get("TTL", _DEFAULT_TTL))
                 return ip, max(ttl, 10.0)
         except Exception:
             continue
+    return None
+
+
+async def _query_doh(hostname: str) -> tuple[str, float]:
+    """
+    Try A record first; fall back to AAAA if no A record found.
+    Raises OSError if both fail.
+    """
+    result = await _query_doh_type(hostname, "A")
+    if result:
+        return result
+    result = await _query_doh_type(hostname, "AAAA")
+    if result:
+        return result
     raise OSError(f"DoH resolution failed for {hostname!r}")
 
 

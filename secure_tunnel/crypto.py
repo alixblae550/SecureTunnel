@@ -31,13 +31,7 @@ try:
     HAS_MLKEM = True
     _MLKEM_PARAMS = MLKEMParameters.ML_KEM_768   # 192-bit post-quantum security
 except ImportError:
-    import warnings
-    warnings.warn(
-        "ML-KEM-768 (post-quantum KEM) unavailable: requires cryptography >= 43.0.0. "
-        "Falling back to X25519-only key exchange (classical security only). "
-        "Run: pip install -U cryptography",
-        stacklevel=1,
-    )
+    print("[crypto] Post-quantum KEM unavailable, using X25519 (classical encryption)", flush=True)
     HAS_MLKEM = False
     MLKEMPrivateKey = None   # type: ignore[assignment,misc]
     _MLKEM_PARAMS = None

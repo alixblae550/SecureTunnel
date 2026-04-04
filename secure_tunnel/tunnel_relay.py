@@ -78,6 +78,26 @@ def _sinusoidal_cover_interval() -> float:
 _circuit = CircuitManager()
 
 # ---------------------------------------------------------------------------
+# Bandwidth counters (printed every second for the launcher to parse)
+# ---------------------------------------------------------------------------
+
+_bytes_in  = 0   # bytes received from internet through tunnel
+_bytes_out = 0   # bytes sent to internet through tunnel
+_bw_task: asyncio.Task | None = None
+
+
+async def _bw_reporter():
+    """Print bandwidth stats every second for the launcher to display."""
+    global _bytes_in, _bytes_out
+    while True:
+        await asyncio.sleep(1)
+        bi, bo = _bytes_in, _bytes_out
+        _bytes_in = 0
+        _bytes_out = 0
+        print(f"[relay] bw: {bi // 1024}↓ {bo // 1024}↑ KB/s", flush=True)
+
+
+# ---------------------------------------------------------------------------
 # Connection pool
 # ---------------------------------------------------------------------------
 
@@ -202,12 +222,14 @@ async def _pool_filler():
 async def start_pool():
     """Start background pool filler and wait until first connection is ready."""
     global _fresh_sem, _pool_filler_task
+    global _bw_task
     _fresh_sem = asyncio.Semaphore(4)
     _pool_filler_task = asyncio.create_task(_pool_filler())
+    _bw_task = asyncio.create_task(_bw_reporter())
     print("[relay] warming up tunnel connection pool...")
     while _pool is None or _pool.empty():
         await asyncio.sleep(0.1)
-    print("[relay] tunnel pool ready")
+    print("[relay] tunnel pool ready", flush=True)
 
 
 async def _acquire_connection():
@@ -330,7 +352,9 @@ async def relay_through_tunnel(
                         await asyncio.sleep(
                             _JITTER_MIN + (_JITTER_MAX - _JITTER_MIN) * secrets.randbelow(1000) / 1000.0
                         )
+                    global _bytes_out
                     _last_activity = asyncio.get_event_loop().time()
+                    _bytes_out += len(data)
                     await ws.send(_send_cmd({"cmd": "DATA", "data": data}))
             except (ConnectionResetError, BrokenPipeError, OSError):
                 pass
@@ -344,6 +368,7 @@ async def relay_through_tunnel(
                     pass
 
         async def tunnel_to_browser():
+            global _bytes_in
             nonlocal _last_activity
             try:
                 async for raw_frame in ws:
@@ -364,6 +389,7 @@ async def relay_through_tunnel(
                     if cmd == "DATA":
                         data = obj.get("data", b"")
                         _last_activity = asyncio.get_event_loop().time()
+                        _bytes_in += len(data)
                         browser_writer.write(
                             bytes(data) if not isinstance(data, bytes) else data
                         )

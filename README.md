@@ -271,7 +271,7 @@ chrome --proxy-server="socks5://127.0.0.1:1080"
 
 ---
 
-## 6. Функции v1.1.0
+## 6. Функции v4.1.0
 
 ### Kill Switch
 При активации добавляет правила Windows Firewall:

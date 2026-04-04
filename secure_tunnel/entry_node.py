@@ -52,7 +52,7 @@ _entry_priv, _entry_pub = load_or_generate(NODE_NAME)
 # Middle-node connection pool
 # ---------------------------------------------------------------------------
 
-_POOL_SIZE = 20
+_POOL_SIZE = 8
 _middle_pool: asyncio.Queue | None = None
 _middle_fresh_sem: asyncio.Semaphore | None = None
 
@@ -223,7 +223,7 @@ async def handler(ws):
 
 async def main():
     global _middle_fresh_sem
-    _middle_fresh_sem = asyncio.Semaphore(4)
+    _middle_fresh_sem = asyncio.Semaphore(8)
     asyncio.create_task(_pool_filler())
 
     print("[entry] warming up middle connection pool…")

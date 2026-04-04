@@ -101,7 +101,7 @@ async def _bw_reporter():
 # Connection pool
 # ---------------------------------------------------------------------------
 
-_POOL_SIZE = 20
+_POOL_SIZE = 8
 _pool: asyncio.Queue | None = None
 _fresh_sem: asyncio.Semaphore | None = None
 _pool_filler_task: asyncio.Task | None = None
@@ -223,7 +223,7 @@ async def start_pool():
     """Start background pool filler and wait until first connection is ready."""
     global _fresh_sem, _pool_filler_task
     global _bw_task
-    _fresh_sem = asyncio.Semaphore(4)
+    _fresh_sem = asyncio.Semaphore(8)
     _pool_filler_task = asyncio.create_task(_pool_filler())
     _bw_task = asyncio.create_task(_bw_reporter())
     print("[relay] warming up tunnel connection pool...")

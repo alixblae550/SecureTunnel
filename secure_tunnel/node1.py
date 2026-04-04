@@ -50,7 +50,7 @@ _node1_priv, _node1_pub = load_or_generate(NODE_NAME)
 # Exit-node connection pool
 # ---------------------------------------------------------------------------
 
-_POOL_SIZE = 20
+_POOL_SIZE = 8
 _exit_pool: asyncio.Queue | None = None
 _exit_fresh_sem: asyncio.Semaphore | None = None
 
@@ -206,7 +206,7 @@ async def handler(ws):
 
 async def main():
     global _exit_fresh_sem
-    _exit_fresh_sem = asyncio.Semaphore(4)
+    _exit_fresh_sem = asyncio.Semaphore(8)
     asyncio.create_task(_pool_filler())
 
     print("[node1] warming up exit connection pool…")

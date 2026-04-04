@@ -137,54 +137,12 @@ def _is_system_proxy_active() -> bool:
         return False
 
 
-# ── Kill Switch (Windows Firewall) ────────────────────────────────────────────
+# ── Kill Switch (Windows Firewall) — implemented in secure_tunnel.ui.kill_switch ──
 
-_KS_RULE = "SecureTunnel-KillSwitch"
-
-
-def _is_admin() -> bool:
-    try:
-        return bool(ctypes.windll.shell32.IsUserAnAdmin())
-    except Exception:
-        return False
-
-
-def _ks_activate(exe_path: str) -> bool:
-    """
-    Hard kill switch: block ALL outbound traffic except from SecureTunnel.exe.
-    Requires administrator privileges.
-    Returns True on success.
-    """
-    try:
-        # 1. Block all outbound
-        subprocess.run([
-            "netsh", "advfirewall", "firewall", "add", "rule",
-            f"name={_KS_RULE}-Block", "dir=out", "action=block",
-            "protocol=any",
-        ], capture_output=True, check=True)
-        # 2. Allow outbound from our own exe (tunnel traffic to nodes + exit→internet)
-        subprocess.run([
-            "netsh", "advfirewall", "firewall", "add", "rule",
-            f"name={_KS_RULE}-Allow", "dir=out", "action=allow",
-            "protocol=any", f"program={exe_path}",
-        ], capture_output=True, check=True)
-        return True
-    except Exception:
-        return False
-
-
-def _ks_deactivate() -> None:
-    """Remove kill switch firewall rules."""
-    for suffix in ("-Block", "-Allow"):
-        subprocess.run([
-            "netsh", "advfirewall", "firewall", "delete", "rule",
-            f"name={_KS_RULE}{suffix}",
-        ], capture_output=True)
-
-
-def _ks_cleanup() -> None:
-    """Called at exit to ensure firewall rules are always removed."""
-    _ks_deactivate()
+_is_admin      = _ks.is_admin
+_ks_activate   = _ks.activate
+_ks_deactivate = _ks.deactivate
+_ks_cleanup    = _ks.cleanup
 
 
 # ── AUTH_SECRET ───────────────────────────────────────────────────────────────
@@ -248,6 +206,9 @@ def _save_settings(base: Path, settings: dict) -> None:
 # ── Auto-update ───────────────────────────────────────────────────────────────
 
 from secure_tunnel.version import __version__ as APP_VERSION
+from secure_tunnel.ui.toast import notify as _toast_notify_fn
+from secure_tunnel.ui import kill_switch as _ks
+from secure_tunnel.ui.settings_dialog import open_settings_dialog as _open_settings_dialog
 _GITHUB_REPO = ""   # Set to "owner/repo" to enable auto-update checks
 
 
@@ -292,47 +253,8 @@ def _check_update_bg(callback) -> None:
 
 
 def _toast_notify(title: str, message: str) -> None:
-    """
-    Show a Windows balloon-tip notification via the Win32 Shell_NotifyIcon API.
-    Falls back silently if the tray icon is not available.
-    No PowerShell, no subprocess — pure ctypes.
-    """
-    if not _HAS_TRAY:
-        return
-    try:
-        import ctypes
-        from ctypes import wintypes
-        # Constants
-        NIM_MODIFY      = 0x00000001
-        NIF_INFO        = 0x00000010
-        NIIF_INFO       = 0x00000001
-        # NOTIFYICONDATA structure (simplified, 952 bytes on 64-bit)
-        class NOTIFYICONDATA(ctypes.Structure):
-            _fields_ = [
-                ("cbSize",           wintypes.DWORD),
-                ("hWnd",             wintypes.HWND),
-                ("uID",              wintypes.UINT),
-                ("uFlags",           wintypes.UINT),
-                ("uCallbackMessage", wintypes.UINT),
-                ("hIcon",            wintypes.HANDLE),
-                ("szTip",            ctypes.c_wchar * 128),
-                ("dwState",          wintypes.DWORD),
-                ("dwStateMask",      wintypes.DWORD),
-                ("szInfo",           ctypes.c_wchar * 256),
-                ("uTimeout",         wintypes.UINT),
-                ("szInfoTitle",      ctypes.c_wchar * 64),
-                ("dwInfoFlags",      wintypes.DWORD),
-            ]
-        nid = NOTIFYICONDATA()
-        nid.cbSize      = ctypes.sizeof(NOTIFYICONDATA)
-        nid.uFlags      = NIF_INFO
-        nid.szInfo      = message[:255]
-        nid.szInfoTitle = title[:63]
-        nid.dwInfoFlags = NIIF_INFO
-        nid.uTimeout    = 5000
-        ctypes.windll.shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(nid))
-    except Exception:
-        pass
+    """Thin wrapper that passes the tray availability flag to ui.toast.notify."""
+    _toast_notify_fn(title, message, has_tray=_HAS_TRAY)
 
 
 def _write_proxy_pac(base: Path, domains_raw: str) -> None:
@@ -909,113 +831,14 @@ class Launcher:
     # ── Settings dialog ───────────────────────────────────────────────────────
 
     def open_settings(self):
-        """Open a modal settings dialog for configuring ports."""
-        if self._running:
-            self.log_line("[launcher] Останови туннель перед изменением настроек.\n", "err")
-            return
-        dlg = tk.Toplevel(self.root)
-        dlg.title("Настройки SecureTunnel")
-        dlg.resizable(False, False)
-        dlg.grab_set()
-        dlg.configure(bg="#252526")
-
-        settings = _load_settings(BASE)
-
-        # ── Режим: Локальный / Удалённый ────────────────────────────────────
-        mode_var = tk.StringVar(value=settings.get("mode", "local"))
-        mode_frame = tk.Frame(dlg, bg="#252526")
-        mode_frame.grid(row=0, column=0, columnspan=2, padx=10, pady=(8, 2), sticky="w")
-        tk.Label(mode_frame, text="Режим:", bg="#252526", fg="#9cdcfe",
-                 font=("Consolas", 9, "bold")).pack(side="left")
-        tk.Radiobutton(mode_frame, text="Локальный (все узлы здесь)", variable=mode_var,
-                       value="local", bg="#252526", fg="#d4d4d4", selectcolor="#3c3c3c",
-                       font=("Consolas", 9), activebackground="#252526",
-                       activeforeground="white").pack(side="left", padx=8)
-        tk.Radiobutton(mode_frame, text="Удалённый (VPS серверы)", variable=mode_var,
-                       value="remote", bg="#252526", fg="#d4d4d4", selectcolor="#3c3c3c",
-                       font=("Consolas", 9), activebackground="#252526",
-                       activeforeground="white").pack(side="left", padx=4)
-
-        # ── Порты ────────────────────────────────────────────────────────────
-        tk.Label(dlg, text="── Локальные порты ──", bg="#252526", fg="#569cd6",
-                 font=("Consolas", 9)).grid(row=1, column=0, columnspan=2, pady=(6, 2))
-
-        port_fields = [
-            ("SOCKS5 порт",   "socks5_port",  str(settings.get("socks5_port", 1080))),
-            ("HTTP порт",     "http_port",    str(settings.get("http_port",   8080))),
-            ("Entry порт",    "entry_port",   str(settings.get("entry_port",  8765))),
-            ("Middle порт",   "middle_port",  str(settings.get("middle_port", 8766))),
-            ("Exit порт",     "exit_port",    str(settings.get("exit_port",   8767))),
-        ]
-
-        entries = {}
-        for i, (label, key, default) in enumerate(port_fields):
-            row = i + 2
-            tk.Label(dlg, text=label, bg="#252526", fg="#d4d4d4",
-                     font=("Consolas", 9), anchor="w", width=16).grid(
-                row=row, column=0, padx=10, pady=3, sticky="w")
-            var = tk.StringVar(value=default)
-            e = tk.Entry(dlg, textvariable=var, width=8, bg="#3c3c3c", fg="white",
-                         insertbackground="white", relief="flat",
-                         font=("Consolas", 9))
-            e.grid(row=row, column=1, padx=10, pady=3, sticky="w")
-            entries[key] = var
-
-        # ── VPS адреса (только в Remote режиме) ──────────────────────────────
-        tk.Label(dlg, text="── VPS адреса (Remote режим) ──", bg="#252526", fg="#569cd6",
-                 font=("Consolas", 9)).grid(row=7, column=0, columnspan=2, pady=(8, 2))
-
-        vps_fields = [
-            ("Entry IP",    "entry_host",   settings.get("entry_host",  "127.0.0.1")),
-            ("Middle IP",   "middle_host",  settings.get("middle_host", "127.0.0.1")),
-            ("Exit IP",     "exit_host",    settings.get("exit_host",   "127.0.0.1")),
-        ]
-        for i, (label, key, default) in enumerate(vps_fields):
-            row = i + 8
-            tk.Label(dlg, text=label, bg="#252526", fg="#d4d4d4",
-                     font=("Consolas", 9), anchor="w", width=16).grid(
-                row=row, column=0, padx=10, pady=3, sticky="w")
-            var = tk.StringVar(value=default)
-            tk.Entry(dlg, textvariable=var, width=18, bg="#3c3c3c", fg="white",
-                     insertbackground="white", relief="flat",
-                     font=("Consolas", 9)).grid(row=row, column=1, padx=10, pady=3, sticky="w")
-            entries[key] = var
-
-        def save():
-            new = {"mode": mode_var.get()}
-            port_keys = {f[1] for f in port_fields}
-            for key, var in entries.items():
-                if key in port_keys:
-                    try:
-                        val = int(var.get())
-                        if not (1 <= val <= 65535):
-                            raise ValueError
-                        new[key] = val
-                    except ValueError:
-                        self.log_line(f"[launcher] Неверный порт для {key}.\n", "err")
-                        return
-                else:
-                    new[key] = var.get().strip()
-            _save_settings(BASE, new)
-            self.log_line("[launcher] Настройки сохранены. Применятся при следующем запуске.\n", "info")
-            dlg.destroy()
-
-        def reset():
-            mode_var.set("local")
-            defaults = {"socks5_port": 1080, "http_port": 8080,
-                        "entry_port": 8765, "middle_port": 8766, "exit_port": 8767,
-                        "entry_host": "127.0.0.1", "middle_host": "127.0.0.1", "exit_host": "127.0.0.1"}
-            for key, var in entries.items():
-                var.set(str(defaults.get(key, "")))
-
-        btn_frame = tk.Frame(dlg, bg="#252526")
-        btn_frame.grid(row=len(fields), column=0, columnspan=2, pady=8)
-        tk.Button(btn_frame, text="Сохранить", command=save,
-                  bg="#0e639c", fg="white", relief="flat", width=12).pack(side="left", padx=6)
-        tk.Button(btn_frame, text="По умолчанию", command=reset,
-                  bg="#3a3a3a", fg="white", relief="flat", width=14).pack(side="left", padx=6)
-        tk.Button(btn_frame, text="Отмена", command=dlg.destroy,
-                  bg="#3a3a3a", fg="white", relief="flat", width=10).pack(side="left", padx=6)
+        """Open a modal settings dialog for configuring ports and VPS hosts."""
+        _open_settings_dialog(
+            root=self.root,
+            is_running=self._running,
+            settings=_load_settings(BASE),
+            save_fn=lambda s: _save_settings(BASE, s),
+            log_fn=self.log_line,
+        )
 
     # ── Split tunneling ───────────────────────────────────────────────────────
 

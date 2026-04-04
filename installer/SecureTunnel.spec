@@ -31,6 +31,10 @@ a = Analysis(
         'secure_tunnel.keyring',
         'secure_tunnel.transport.tls_in_tls_transport',
         'secure_tunnel.logging.anon_logger',
+        # UI modules
+        'secure_tunnel.ui.toast',
+        'secure_tunnel.ui.kill_switch',
+        'secure_tunnel.ui.settings_dialog',
         # Cryptography
         'cryptography',
         'cryptography.hazmat.primitives.asymmetric.x25519',

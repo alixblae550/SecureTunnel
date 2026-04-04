@@ -9,6 +9,8 @@ Responsibilities
   • Maintain a pool of pre-warmed TLS-in-TLS connections to the exit node.
   • For each entry session: acquire an exit connection, peel K2, re-encrypt
     with K3, and forward bidirectionally.
+  • Support circuit EXTEND: handle RELAY_HANDSHAKE (K2 independent key
+    negotiation) and EXTEND_K3 (forward K3 negotiation to exit).
 
 Security properties
 ────────────────────
@@ -95,12 +97,13 @@ async def _pool_filler():
                         if not isinstance(conn, (ConnectionResetError, BrokenPipeError,
                                                  ConnectionError, OSError,
                                                  asyncio.TimeoutError)):
-                            print(f"[node1] pool fill error: {type(conn).__name__}: {conn}")
+                            log_event(NODE_NAME, 0, 0, 0,
+                                      f"pool_fill_error:{type(conn).__name__}")
                     else:
                         await _exit_pool.put(conn)
                 current = _exit_pool.qsize()
                 if current != _last_reported:
-                    print(f"[node1] exit pool: {current}/{_POOL_SIZE} ready")
+                    log_event(NODE_NAME, 0, 0, current, "pool_ready")
                     _last_reported = current
             else:
                 await asyncio.sleep(0.05)
@@ -109,7 +112,7 @@ async def _pool_filler():
         except (ConnectionResetError, BrokenPipeError, ConnectionError, OSError):
             await asyncio.sleep(0.5)
         except Exception as e:
-            print(f"[node1] pool fill error: {type(e).__name__}: {e}")
+            log_event(NODE_NAME, 0, 0, 0, f"pool_fill_error:{type(e).__name__}")
             await asyncio.sleep(1.0)
 
 
@@ -119,11 +122,83 @@ async def _acquire_exit():
             return _exit_pool.get_nowait()
         except asyncio.QueueEmpty:
             pass
-    print("[node1] exit pool empty, creating fresh connection")
+    log_event(NODE_NAME, 0, 0, 0, "pool_empty_fresh_conn")
     if _exit_fresh_sem is not None:
         async with _exit_fresh_sem:
             return await connect_to_exit(_node1_priv, _node1_pub)
     return await connect_to_exit(_node1_priv, _node1_pub)
+
+
+# ---------------------------------------------------------------------------
+# EXTEND helpers
+# ---------------------------------------------------------------------------
+
+def _wrap_entry(entry_key: bytes, sid: int, obj: dict) -> bytes:
+    payload = msgpack.packb(obj, use_bin_type=True)
+    return build_frame(entry_key, pack_plain(MSG_DATA, sid, 0, payload))
+
+
+def _wrap_exit(exit_key: bytes, obj: dict) -> bytes:
+    payload = msgpack.packb(obj, use_bin_type=True)
+    return build_frame(exit_key, pack_plain(MSG_DATA, secrets.randbits(32), 0, payload))
+
+
+async def _handle_relay_handshake(
+    ws, entry_key: bytes, session_id: int, req: dict
+) -> None:
+    """
+    Handle RELAY_HANDSHAKE from entry on behalf of the relay client.
+    Middle generates a fresh ephemeral key pair, performs ECDH with
+    the client's public key, and responds — allowing the client to
+    independently derive K2.
+    """
+    client_x_pub_bytes = bytes(req["pub"])
+    client_x_pub = X25519PublicKey.from_public_bytes(client_x_pub_bytes)
+
+    eph_priv = X25519PrivateKey.generate()
+    eph_pub_bytes = eph_priv.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+
+    # ML-KEM encapsulation against client's PQ key (if provided)
+    mlkem_ct: bytes | None = None
+    if req.get("mlkem_pub"):
+        mlkem_ct, _ = mlkem_encapsulate(bytes(req["mlkem_pub"]))
+
+    reply: dict = {"pub": eph_pub_bytes}
+    if mlkem_ct is not None:
+        reply["mlkem_ct"] = mlkem_ct
+    await ws.send(_wrap_entry(entry_key, session_id, reply))
+    log_event(NODE_NAME, session_id, 0, 0, "relay_handshake_ok")
+
+
+async def _handle_extend_k3(
+    ws, entry_key: bytes, session_id: int,
+    exit_ws, exit_key: bytes,
+    req: dict,
+) -> None:
+    """
+    Handle EXTEND_K3 from entry: forward a RELAY_HANDSHAKE to exit so the
+    relay client can independently derive K3.
+
+    Flow:
+      entry  →[K2]→  middle  →[K3]→  exit
+                                        ↓  generates ephemeral keys
+      entry  ←[K2]←  middle  ←[K3]←  exit
+    """
+    extend_msg = {"cmd": "RELAY_HANDSHAKE", "pub": req["pub"]}
+    if req.get("mlkem_pub"):
+        extend_msg["mlkem_pub"] = req["mlkem_pub"]
+
+    await exit_ws.send(_wrap_exit(exit_key, extend_msg))
+    raw_resp = await asyncio.wait_for(exit_ws.recv(), timeout=10.0)
+    plain_resp = parse_frame(exit_key, raw_resp)
+    _, _, _, resp_payload = unpack_plain(plain_resp)
+    resp_obj = msgpack.unpackb(resp_payload, raw=False)
+
+    reply: dict = {"pub": resp_obj["pub"]}
+    if resp_obj.get("mlkem_ct"):
+        reply["mlkem_ct"] = resp_obj["mlkem_ct"]
+    await ws.send(_wrap_entry(entry_key, session_id, reply))
+    log_event(NODE_NAME, session_id, 0, 0, "extend_k3_ok")
 
 
 # ---------------------------------------------------------------------------
@@ -155,6 +230,55 @@ async def handler(ws):
     # ── Acquire exit connection (K3) ──────────────────────────────────────────
     exit_ws, exit_key, exit_ctx = await _acquire_exit()
 
+    # ── EXTEND phase (before forwarding loop) ────────────────────────────────
+    # Handle RELAY_HANDSHAKE (for K2) and EXTEND_K3 (for K3) before the
+    # main bidirectional forward loop starts.
+    first_payload: bytes | None = None
+
+    while True:
+        raw_frame = await ws.recv()
+        try:
+            plain = parse_frame(entry_key, raw_frame)
+        except Exception as e:
+            log_event(hop_id, session_id, 0, 0, f"parse_error:{e}")
+            break
+        _, _, _, payload = unpack_plain(plain)
+        obj = msgpack.unpackb(payload, raw=False)
+        cmd = obj.get("cmd")
+
+        if cmd == "RELAY_HANDSHAKE":
+            try:
+                await _handle_relay_handshake(ws, entry_key, session_id, obj)
+            except Exception as e:
+                log_event(hop_id, session_id, 0, 0, f"relay_handshake_error:{e}")
+                ws.close()
+                exit_ws.close()
+                return
+            continue
+
+        if cmd == "EXTEND_K3":
+            try:
+                await _handle_extend_k3(ws, entry_key, session_id, exit_ws, exit_key, obj)
+            except Exception as e:
+                log_event(hop_id, session_id, 0, 0, f"extend_k3_error:{e}")
+                ws.close()
+                exit_ws.close()
+                return
+            continue
+
+        # First non-EXTEND frame — enter the forward loop
+        first_payload = payload
+        break
+
+    if first_payload is None:
+        ws.close()
+        exit_ws.close()
+        try:
+            await exit_ctx.__aexit__(None, None, None)
+        except Exception:
+            pass
+        return
+
     # ── Forward entry→exit (peel K2, re-wrap K3) ─────────────────────────────
     async def forward_responses():
         """exit → entry: peel K3, re-wrap K2."""
@@ -167,11 +291,24 @@ async def handler(ws):
                                         pack_plain(MSG_DATA, session_id, 0, payload))
                     await ws.send(resp)
                 except Exception as e:
-                    print(f"[node1] forward error: {e}")
+                    log_event(hop_id, session_id, 0, 0, f"fwd_error:{e}")
         finally:
             ws.close()
 
     fwd_task = asyncio.create_task(forward_responses())
+
+    # Handle the first payload already read in the EXTEND phase
+    try:
+        fwd_frame = build_frame(exit_key,
+                                pack_plain(MSG_DATA, secrets.randbits(32), 0, first_payload))
+        await exit_ws.send(fwd_frame)
+        log_event(hop_id, session_id, MSG_DATA, len(first_payload), "in")
+    except Exception as e:
+        log_event(hop_id, session_id, 0, 0, f"first_fwd_error:{e}")
+        fwd_task.cancel()
+        ws.close()
+        exit_ws.close()
+        return
 
     async for raw_frame in ws:
         try:
@@ -183,7 +320,7 @@ async def handler(ws):
             await exit_ws.send(fwd_frame)
             log_event(hop_id, session_id, MSG_DATA, len(payload), "out")
         except Exception as e:
-            print(f"[node1] error: {e}")
+            log_event(hop_id, session_id, 0, 0, f"entry_exit_error:{e}")
             break
 
     fwd_task.cancel()

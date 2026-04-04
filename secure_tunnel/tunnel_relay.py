@@ -38,6 +38,7 @@ from secure_tunnel.crypto import derive_session_key, mlkem_generate, mlkem_decap
 from secure_tunnel.framing import build_frame, parse_frame
 from secure_tunnel.protocol import pack_plain, unpack_plain, MSG_DATA, MSG_COVER
 from secure_tunnel.circuit import CircuitManager
+from secure_tunnel.logging.anon_logger import log_event
 
 # Entry node is always the first (and only) direct peer for the relay
 ENTRY_HOST = ROUTE[0]["host"]
@@ -167,7 +168,7 @@ async def _drain_pool():
                 pass
         except asyncio.QueueEmpty:
             break
-    print("[relay] pool drained for circuit rotation")
+    log_event("relay", 0, 0, 0, "pool_drained")
 
 
 async def _fill_pool_once():
@@ -186,7 +187,7 @@ async def _fill_pool_once():
             if not isinstance(conn, (ConnectionResetError, BrokenPipeError,
                                      ConnectionError, OSError,
                                      asyncio.TimeoutError)):
-                print(f"[relay] pool fill error: {type(conn).__name__}: {conn}")
+                log_event("relay", 0, 0, 0, f"pool_fill_error:{type(conn).__name__}")
         else:
             await _pool.put(conn)
 
@@ -216,7 +217,7 @@ async def _pool_filler():
         except (ConnectionResetError, BrokenPipeError, ConnectionError, OSError):
             await asyncio.sleep(0.5)
         except Exception as e:
-            print(f"[relay] pool fill error: {type(e).__name__}: {e}")
+            log_event("relay", 0, 0, 0, f"pool_fill_error:{type(e).__name__}")
             await asyncio.sleep(1.0)
 
 
@@ -240,7 +241,7 @@ async def _acquire_connection():
             return _pool.get_nowait()
         except asyncio.QueueEmpty:
             pass
-    print("[relay] pool empty, creating fresh connection")
+    log_event("relay", 0, 0, 0, "pool_empty_fresh")
     if _fresh_sem is not None:
         async with _fresh_sem:
             return await _make_connection()
@@ -309,7 +310,7 @@ async def relay_through_tunnel(
     _deferred_exc: BaseException | None = None
 
     try:
-        print(f"[relay] CONNECT {host}:{port}")
+        log_event("relay", session_id, 0, 0, f"connect:{host}:{port}")
 
         await ws.send(_send_cmd({"cmd": "CONNECT", "host": host, "port": port}))
 
@@ -334,7 +335,7 @@ async def relay_through_tunnel(
         browser_writer.write(b'\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00')
         await browser_writer.drain()
 
-        print(f"[relay] {host}:{port} connected, relaying")
+        log_event("relay", session_id, 0, 0, f"relaying:{host}:{port}")
 
         stop_event = asyncio.Event()
         exit_sent_close = asyncio.Event()
@@ -360,7 +361,7 @@ async def relay_through_tunnel(
             except (ConnectionResetError, BrokenPipeError, OSError):
                 pass
             except Exception as e:
-                print(f"[relay] browser->tunnel error: {e}")
+                log_event("relay", session_id, 0, 0, f"browser_tunnel_error:{type(e).__name__}")
             finally:
                 stop_event.set()
                 try:
@@ -376,7 +377,7 @@ async def relay_through_tunnel(
                     try:
                         _, obj = _parse_cmd(raw_frame)
                     except Exception as e:
-                        print(f"[relay] tunnel->browser parse error: {e}")
+                        log_event("relay", session_id, 0, 0, f"parse_error:{type(e).__name__}")
                         break
                     cmd = obj.get("cmd")
                     if cmd == "CLOSE":
@@ -398,7 +399,7 @@ async def relay_through_tunnel(
             except (ConnectionResetError, BrokenPipeError, OSError):
                 pass
             except Exception as e:
-                print(f"[relay] tunnel->browser error: {e}")
+                log_event("relay", session_id, 0, 0, f"tunnel_browser_error:{type(e).__name__}")
             finally:
                 stop_event.set()
 
@@ -460,7 +461,7 @@ async def relay_through_tunnel(
         if not connect_ok:
             _deferred_exc = e
         else:
-            print(f"[relay] error: {type(e).__name__}: {e}")
+            log_event("relay", session_id, 0, 0, f"relay_error:{type(e).__name__}")
     finally:
         if connect_ok:
             try:
@@ -518,11 +519,11 @@ async def relay_udp_through_tunnel(host: str, port: int, data: bytes) -> bytes |
             resp_data = bytes(raw_resp) if not isinstance(raw_resp, bytes) else raw_resp
             ok = True
         else:
-            print(f"[relay/udp] unexpected response: {obj.get('cmd')}")
+            log_event("relay", 0, 0, 0, f"udp_unexpected_resp")
     except asyncio.TimeoutError:
-        print(f"[relay/udp] timeout for {host}:{port}")
+        log_event("relay", 0, 0, 0, f"udp_timeout:{host}:{port}")
     except Exception as e:
-        print(f"[relay/udp] error: {type(e).__name__}: {e}")
+        log_event("relay", 0, 0, 0, f"udp_error:{type(e).__name__}")
 
     # After a clean UDP exchange the exit node loops back — connection is reusable.
     if ok and _return_to_pool(conn):

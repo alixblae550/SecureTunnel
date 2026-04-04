@@ -10,6 +10,10 @@ Responsibilities
   • For each relay session: acquire a middle connection, peel the relay's
     encryption layer (K1), re-encrypt with the middle's session key (K2),
     and forward bidirectionally.
+  • Support circuit EXTEND: relay client can negotiate K2 (with middle) and
+    K3 (with exit) independently via EXTEND_K2 / EXTEND_K3 commands before
+    the main CONNECT/DATA loop starts.  This enables true onion routing where
+    the client holds all three keys and wraps data in three encryption layers.
 
 Security properties
 ────────────────────
@@ -98,12 +102,13 @@ async def _pool_filler():
                     if isinstance(conn, Exception):
                         if not isinstance(conn, (ConnectionError, OSError,
                                                  asyncio.TimeoutError)):
-                            print(f"[entry] pool fill error: {type(conn).__name__}: {conn}")
+                            log_event(NODE_NAME, 0, 0, 0,
+                                      f"pool_fill_error:{type(conn).__name__}")
                     else:
                         await _middle_pool.put(conn)
                 current = _middle_pool.qsize()
                 if current != _last_reported:
-                    print(f"[entry] middle pool: {current}/{_POOL_SIZE} ready")
+                    log_event(NODE_NAME, 0, 0, current, "pool_ready")
                     _last_reported = current
             else:
                 await asyncio.sleep(0.05)
@@ -112,7 +117,7 @@ async def _pool_filler():
         except (ConnectionError, OSError):
             await asyncio.sleep(0.5)
         except Exception as e:
-            print(f"[entry] pool fill error: {type(e).__name__}: {e}")
+            log_event(NODE_NAME, 0, 0, 0, f"pool_fill_error:{type(e).__name__}")
             await asyncio.sleep(1.0)
 
 
@@ -122,7 +127,7 @@ async def _acquire_middle():
             return _middle_pool.get_nowait()
         except asyncio.QueueEmpty:
             pass
-    print("[entry] middle pool empty, creating fresh connection")
+    log_event(NODE_NAME, 0, 0, 0, "pool_empty_fresh_conn")
     if _middle_fresh_sem is not None:
         async with _middle_fresh_sem:
             return await _connect_to_middle()
@@ -137,6 +142,84 @@ def _return_middle(conn):
         except asyncio.QueueFull:
             pass
     return False
+
+
+# ---------------------------------------------------------------------------
+# EXTEND helpers — allow relay to negotiate K2 and K3 independently
+# ---------------------------------------------------------------------------
+
+def _wrap_relay(relay_key: bytes, sid: int, obj: dict) -> bytes:
+    payload = msgpack.packb(obj, use_bin_type=True)
+    return build_frame(relay_key, pack_plain(MSG_DATA, sid, 0, payload))
+
+
+def _wrap_middle(middle_key: bytes, obj: dict) -> bytes:
+    payload = msgpack.packb(obj, use_bin_type=True)
+    return build_frame(middle_key, pack_plain(MSG_DATA, secrets.randbits(32), 0, payload))
+
+
+async def _extend_k2(
+    middle_ws, middle_key: bytes,
+    relay_key: bytes, sid: int,
+    ws,
+    req: dict,
+) -> None:
+    """
+    Handle EXTEND_K2: relay a key-exchange handshake to middle so the client
+    can derive K2 independently (without entry learning K2).
+
+    Flow:
+      client  →[K1]→  entry  →[K2]→  middle
+                                        ↓  generates ephemeral keys
+      client  ←[K1]←  entry  ←[K2]←  middle
+    """
+    extend_msg = {"cmd": "RELAY_HANDSHAKE", "pub": req["pub"]}
+    if req.get("mlkem_pub"):
+        extend_msg["mlkem_pub"] = req["mlkem_pub"]
+
+    await middle_ws.send(_wrap_middle(middle_key, extend_msg))
+    raw_resp = await asyncio.wait_for(middle_ws.recv(), timeout=10.0)
+    plain_resp = parse_frame(middle_key, raw_resp)
+    _, _, _, resp_payload = unpack_plain(plain_resp)
+    resp_obj = msgpack.unpackb(resp_payload, raw=False)
+
+    reply: dict = {"cmd": "EXTEND_K2_OK", "pub": resp_obj["pub"]}
+    if resp_obj.get("mlkem_ct"):
+        reply["mlkem_ct"] = resp_obj["mlkem_ct"]
+    await ws.send(_wrap_relay(relay_key, sid, reply))
+    log_event(NODE_NAME, sid, 0, 0, "extend_k2_ok")
+
+
+async def _extend_k3(
+    middle_ws, middle_key: bytes,
+    relay_key: bytes, sid: int,
+    ws,
+    req: dict,
+) -> None:
+    """
+    Handle EXTEND_K3: forward the request to middle which in turn forwards
+    a RELAY_HANDSHAKE to exit so the client can derive K3.
+
+    Flow:
+      client  →[K1]→  entry  →[K2]→  middle  →[K3]→  exit
+                                                         ↓
+      client  ←[K1]←  entry  ←[K2]←  middle  ←[K3]←  exit
+    """
+    extend_msg = {"cmd": "EXTEND_K3", "pub": req["pub"]}
+    if req.get("mlkem_pub"):
+        extend_msg["mlkem_pub"] = req["mlkem_pub"]
+
+    await middle_ws.send(_wrap_middle(middle_key, extend_msg))
+    raw_resp = await asyncio.wait_for(middle_ws.recv(), timeout=10.0)
+    plain_resp = parse_frame(middle_key, raw_resp)
+    _, _, _, resp_payload = unpack_plain(plain_resp)
+    resp_obj = msgpack.unpackb(resp_payload, raw=False)
+
+    reply: dict = {"cmd": "EXTEND_K3_OK", "pub": resp_obj["pub"]}
+    if resp_obj.get("mlkem_ct"):
+        reply["mlkem_ct"] = resp_obj["mlkem_ct"]
+    await ws.send(_wrap_relay(relay_key, sid, reply))
+    log_event(NODE_NAME, sid, 0, 0, "extend_k3_ok")
 
 
 # ---------------------------------------------------------------------------
@@ -156,7 +239,6 @@ async def handler(ws):
     peer_pub  = X25519PublicKey.from_public_bytes(bytes(hello["pub"]))
     x25519_ss = _entry_priv.exchange(peer_pub)
 
-    # ML-KEM: if relay sent a public key, encapsulate and send ciphertext back
     mlkem_ct:  bytes | None = None
     mlkem_ss_: bytes | None = None
     if hello.get("mlkem_pub"):
@@ -173,6 +255,56 @@ async def handler(ws):
     # ── Acquire middle connection (K2) ────────────────────────────────────────
     middle_ws, middle_key, middle_ctx = await _acquire_middle()
 
+    # ── EXTEND phase (before forwarding loop) ────────────────────────────────
+    # Client may optionally send EXTEND_K2 / EXTEND_K3 to independently
+    # negotiate per-hop keys for true onion routing.  These are handled here
+    # before the bidirectional forward loop starts.
+    first_payload: bytes | None = None
+
+    while True:
+        raw_frame = await ws.recv()
+        try:
+            plain = parse_frame(relay_key, raw_frame)
+        except Exception as e:
+            log_event(hop_id, session_id, 0, 0, f"parse_error:{e}")
+            break
+        _, _, _, payload = unpack_plain(plain)
+        obj = msgpack.unpackb(payload, raw=False)
+        cmd = obj.get("cmd")
+
+        if cmd == "EXTEND_K2":
+            try:
+                await _extend_k2(middle_ws, middle_key, relay_key, session_id, ws, obj)
+            except Exception as e:
+                log_event(hop_id, session_id, 0, 0, f"extend_k2_error:{e}")
+                ws.close()
+                middle_ws.close()
+                return
+            continue
+
+        if cmd == "EXTEND_K3":
+            try:
+                await _extend_k3(middle_ws, middle_key, relay_key, session_id, ws, obj)
+            except Exception as e:
+                log_event(hop_id, session_id, 0, 0, f"extend_k3_error:{e}")
+                ws.close()
+                middle_ws.close()
+                return
+            continue
+
+        # First non-EXTEND frame — enter the forward loop
+        first_payload = payload
+        break
+
+    if first_payload is None:
+        ws.close()
+        middle_ws.close()
+        try:
+            await middle_ctx.__aexit__(None, None, None)
+        except Exception:
+            pass
+        return
+
     # ── Forward relay→middle (peel K1, re-wrap K2) ───────────────────────────
     async def forward_responses():
         """middle → relay: peel K2, re-wrap K1."""
@@ -184,11 +316,24 @@ async def handler(ws):
                     resp    = build_frame(relay_key, pack_plain(MSG_DATA, session_id, 0, payload))
                     await ws.send(resp)
                 except Exception as e:
-                    print(f"[entry] forward error: {e}")
+                    log_event(hop_id, session_id, 0, 0, f"fwd_error:{e}")
         finally:
             ws.close()
 
     fwd_task = asyncio.create_task(forward_responses())
+
+    # Handle the first payload we already read before entering the loop
+    try:
+        fwd_frame = build_frame(middle_key,
+                                pack_plain(MSG_DATA, secrets.randbits(32), 0, first_payload))
+        await middle_ws.send(fwd_frame)
+        log_event(hop_id, session_id, MSG_DATA, len(first_payload), "in")
+    except Exception as e:
+        log_event(hop_id, session_id, 0, 0, f"first_fwd_error:{e}")
+        fwd_task.cancel()
+        ws.close()
+        middle_ws.close()
+        return
 
     async for raw_frame in ws:
         try:
@@ -200,7 +345,7 @@ async def handler(ws):
             await middle_ws.send(fwd_frame)
             log_event(hop_id, session_id, MSG_DATA, len(payload), "out")
         except Exception as e:
-            print(f"[entry] relay→middle error: {e}")
+            log_event(hop_id, session_id, 0, 0, f"relay_middle_error:{e}")
             break
 
     fwd_task.cancel()

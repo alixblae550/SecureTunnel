@@ -81,22 +81,18 @@ class CircuitManager:
                 return
 
             self._rotating = True
-            log_event("relay", 0, 0, 0, "circuit_rotate_start")
-            print(
-                f"[circuit] rotating — age={self.age():.0f}s "
-                f"requests={self._requests}"
-            )
+            log_event("relay", 0, 0, 0,
+                      f"circuit_rotate_start:age={self.age():.0f}s"
+                      f":requests={self._requests}")
 
             try:
                 await drain_fn()
                 self._born_at = time.monotonic()
                 self._requests = 0
                 await fill_fn()
-                print("[circuit] rotation complete — new circuit active")
                 log_event("relay", 0, 0, 0, "circuit_rotate_done")
             except Exception as e:
-                print(f"[circuit] rotation error: {e}")
-                log_event("relay", 0, 0, 0, f"circuit_rotate_error:{e}")
+                log_event("relay", 0, 0, 0, f"circuit_rotate_error:{type(e).__name__}")
             finally:
                 self._rotating = False
 

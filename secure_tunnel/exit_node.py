@@ -9,6 +9,8 @@ Responsibilities
   • Receive CONNECT commands, resolve targets via DNS-over-HTTPS.
   • Relay data bidirectionally between the tunnel and the internet.
   • Reuse tunnel connections across multiple CONNECT sessions (connection reuse).
+  • Handle RELAY_HANDSHAKE: generate ephemeral keys so the relay client can
+    independently derive K3 (used for true onion routing via onion_client).
 
 Security properties
 ────────────────────
@@ -20,7 +22,7 @@ import secrets
 import socket
 
 import msgpack
-from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PublicKey
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 from secure_tunnel.config import NODES
@@ -103,6 +105,31 @@ async def _handle_udp(ws, obj: dict, send_cmd) -> None:
         print(f"[exit/udp] failed to send UDP_RESP: {e}")
 
 
+async def _handle_relay_handshake(ws, session_key: bytes, session_id: int,
+                                   send_cmd, obj: dict) -> None:
+    """
+    Handle RELAY_HANDSHAKE from middle on behalf of the relay client.
+    Exit generates a fresh ephemeral key pair, performs ECDH with the
+    client's public key, and sends back its ephemeral public key (and
+    ML-KEM ciphertext if requested).  This allows the relay client to
+    independently derive K3 for true onion routing.
+    """
+    client_x_pub = X25519PublicKey.from_public_bytes(bytes(obj["pub"]))
+
+    eph_priv = X25519PrivateKey.generate()
+    eph_pub_bytes = eph_priv.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+
+    mlkem_ct: bytes | None = None
+    if obj.get("mlkem_pub"):
+        mlkem_ct, _ = mlkem_encapsulate(bytes(obj["mlkem_pub"]))
+
+    reply: dict = {"pub": eph_pub_bytes}
+    if mlkem_ct is not None:
+        reply["mlkem_ct"] = mlkem_ct
+    await ws.send(send_cmd(reply))
+    log_event(NODE_NAME, session_id, 0, 0, "relay_handshake_ok")
+
+
 async def handler(ws):
     """
     Handle one middle-node tunnel connection.
@@ -158,6 +185,9 @@ async def handler(ws):
             if cmd == "UDP":
                 await _handle_udp(ws, obj, _send_cmd)
                 # Loop back — connection stays alive for the next command
+                continue
+            if cmd == "RELAY_HANDSHAKE":
+                await _handle_relay_handshake(ws, session_key, session_id, _send_cmd, obj)
                 continue
             # CLOSE / COVER / other cleanup frames — discard
 

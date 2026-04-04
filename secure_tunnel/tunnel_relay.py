@@ -101,7 +101,7 @@ async def _bw_reporter():
 # Connection pool
 # ---------------------------------------------------------------------------
 
-_POOL_SIZE = 8
+_POOL_SIZE = 12
 _pool: asyncio.Queue | None = None
 _fresh_sem: asyncio.Semaphore | None = None
 _pool_filler_task: asyncio.Task | None = None

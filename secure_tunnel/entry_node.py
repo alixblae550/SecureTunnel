@@ -52,7 +52,7 @@ _entry_priv, _entry_pub = load_or_generate(NODE_NAME)
 # Middle-node connection pool
 # ---------------------------------------------------------------------------
 
-_POOL_SIZE = 8
+_POOL_SIZE = 12
 _middle_pool: asyncio.Queue | None = None
 _middle_fresh_sem: asyncio.Semaphore | None = None
 

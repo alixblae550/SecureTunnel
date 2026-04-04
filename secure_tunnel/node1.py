@@ -50,7 +50,7 @@ _node1_priv, _node1_pub = load_or_generate(NODE_NAME)
 # Exit-node connection pool
 # ---------------------------------------------------------------------------
 
-_POOL_SIZE = 8
+_POOL_SIZE = 12
 _exit_pool: asyncio.Queue | None = None
 _exit_fresh_sem: asyncio.Semaphore | None = None
 

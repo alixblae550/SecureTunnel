@@ -199,9 +199,7 @@ async def handle_socks5(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
         try:
             await relay_through_tunnel(reader, writer, host, port)
         except Exception as tunnel_err:
-            import traceback
             print(f"[socks5] tunnel error for {host}:{port}: {tunnel_err}", flush=True)
-            traceback.print_exc()
             # relay_through_tunnel only closes writer when connect_ok;
             # here it failed before that — send error reply then close.
             try:
@@ -215,9 +213,7 @@ async def handle_socks5(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 pass
 
     except Exception as e:
-        import traceback
         print(f"[socks5] handshake error ({peer}): {e}", flush=True)
-        traceback.print_exc()
         try:
             writer.write(_REPLY_REFUSED)
             await writer.drain()

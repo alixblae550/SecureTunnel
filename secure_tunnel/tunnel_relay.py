@@ -31,6 +31,7 @@ from secure_tunnel.config import (
     ROUTE,
     JITTER_MIN_MS, JITTER_MAX_MS,
     COVER_MIN_INTERVAL, COVER_MAX_INTERVAL,
+    POOL_SIZE, POOL_SEMAPHORE,
 )
 from secure_tunnel.transport.tls_in_tls_transport import tls_in_tls_connect
 from secure_tunnel.crypto import derive_session_key, mlkem_generate, mlkem_decapsulate
@@ -101,7 +102,7 @@ async def _bw_reporter():
 # Connection pool
 # ---------------------------------------------------------------------------
 
-_POOL_SIZE = 12
+_POOL_SIZE = POOL_SIZE
 _pool: asyncio.Queue | None = None
 _fresh_sem: asyncio.Semaphore | None = None
 _pool_filler_task: asyncio.Task | None = None
@@ -223,7 +224,7 @@ async def start_pool():
     """Start background pool filler and wait until first connection is ready."""
     global _fresh_sem, _pool_filler_task
     global _bw_task
-    _fresh_sem = asyncio.Semaphore(8)
+    _fresh_sem = asyncio.Semaphore(POOL_SEMAPHORE)
     _pool_filler_task = asyncio.create_task(_pool_filler())
     _bw_task = asyncio.create_task(_bw_reporter())
     print("[relay] warming up tunnel connection pool...")

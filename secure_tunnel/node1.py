@@ -25,7 +25,7 @@ from cryptography.hazmat.primitives.asymmetric.x25519 import (
 )
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
-from secure_tunnel.config import NODES
+from secure_tunnel.config import NODES, POOL_SIZE, POOL_SEMAPHORE
 from secure_tunnel.transport.tls_in_tls_transport import (
     tls_in_tls_serve, tls_in_tls_connect,
 )
@@ -50,7 +50,7 @@ _node1_priv, _node1_pub = load_or_generate(NODE_NAME)
 # Exit-node connection pool
 # ---------------------------------------------------------------------------
 
-_POOL_SIZE = 12
+_POOL_SIZE = POOL_SIZE
 _exit_pool: asyncio.Queue | None = None
 _exit_fresh_sem: asyncio.Semaphore | None = None
 
@@ -206,7 +206,7 @@ async def handler(ws):
 
 async def main():
     global _exit_fresh_sem
-    _exit_fresh_sem = asyncio.Semaphore(8)
+    _exit_fresh_sem = asyncio.Semaphore(POOL_SEMAPHORE)
     asyncio.create_task(_pool_filler())
 
     print("[node1] warming up exit connection pool…")

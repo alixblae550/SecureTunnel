@@ -247,7 +247,7 @@ def _save_settings(base: Path, settings: dict) -> None:
 
 # ── Auto-update ───────────────────────────────────────────────────────────────
 
-APP_VERSION = "4.1.0"
+from secure_tunnel.version import __version__ as APP_VERSION
 _GITHUB_REPO = ""   # Set to "owner/repo" to enable auto-update checks
 
 
@@ -292,22 +292,45 @@ def _check_update_bg(callback) -> None:
 
 
 def _toast_notify(title: str, message: str) -> None:
-    """Show a Windows 10/11 toast notification via PowerShell."""
+    """
+    Show a Windows balloon-tip notification via the Win32 Shell_NotifyIcon API.
+    Falls back silently if the tray icon is not available.
+    No PowerShell, no subprocess — pure ctypes.
+    """
+    if not _HAS_TRAY:
+        return
     try:
-        script = (
-            f"[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType=WindowsRuntime] | Out-Null;"
-            f"$t = [Windows.UI.Notifications.ToastTemplateType]::ToastText02;"
-            f"$xml = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent($t);"
-            f"$xml.GetElementsByTagName('text')[0].AppendChild($xml.CreateTextNode('{title}')) | Out-Null;"
-            f"$xml.GetElementsByTagName('text')[1].AppendChild($xml.CreateTextNode('{message}')) | Out-Null;"
-            f"$app = 'SecureTunnel';"
-            f"[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($app).Show("
-            f"[Windows.UI.Notifications.ToastNotification]::new($xml))"
-        )
-        subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
-            capture_output=True, timeout=5
-        )
+        import ctypes
+        from ctypes import wintypes
+        # Constants
+        NIM_MODIFY      = 0x00000001
+        NIF_INFO        = 0x00000010
+        NIIF_INFO       = 0x00000001
+        # NOTIFYICONDATA structure (simplified, 952 bytes on 64-bit)
+        class NOTIFYICONDATA(ctypes.Structure):
+            _fields_ = [
+                ("cbSize",           wintypes.DWORD),
+                ("hWnd",             wintypes.HWND),
+                ("uID",              wintypes.UINT),
+                ("uFlags",           wintypes.UINT),
+                ("uCallbackMessage", wintypes.UINT),
+                ("hIcon",            wintypes.HANDLE),
+                ("szTip",            ctypes.c_wchar * 128),
+                ("dwState",          wintypes.DWORD),
+                ("dwStateMask",      wintypes.DWORD),
+                ("szInfo",           ctypes.c_wchar * 256),
+                ("uTimeout",         wintypes.UINT),
+                ("szInfoTitle",      ctypes.c_wchar * 64),
+                ("dwInfoFlags",      wintypes.DWORD),
+            ]
+        nid = NOTIFYICONDATA()
+        nid.cbSize      = ctypes.sizeof(NOTIFYICONDATA)
+        nid.uFlags      = NIF_INFO
+        nid.szInfo      = message[:255]
+        nid.szInfoTitle = title[:63]
+        nid.dwInfoFlags = NIIF_INFO
+        nid.uTimeout    = 5000
+        ctypes.windll.shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(nid))
     except Exception:
         pass
 
@@ -369,10 +392,38 @@ class Launcher:
         root.title("SecureTunnel Launcher")
         root.resizable(False, False)
 
+        # ── Title with version and crypto status ────────────────────────────
+        try:
+            from secure_tunnel.crypto import HAS_MLKEM
+            _crypto_status = "X25519 + ML-KEM-768 ✅" if HAS_MLKEM else "X25519 (классическое) ⚠"
+            _crypto_color  = "#4ec9b0" if HAS_MLKEM else "#ce9178"
+        except Exception:
+            _crypto_status = "X25519 (классическое) ⚠"
+            _crypto_color  = "#ce9178"
+        tk.Label(root,
+                 text=f"SecureTunnel v{APP_VERSION}  |  Крипто: {_crypto_status}",
+                 font=("Consolas", 9), fg=_crypto_color).pack(pady=(6, 0))
+
         # ── Status bar ──────────────────────────────────────────────────────
-        self.status_var = tk.StringVar(value="Idle")
+        self.status_var = tk.StringVar(value="Ожидание")
         tk.Label(root, textvariable=self.status_var, font=("Consolas", 10, "bold"),
-                 fg="gray").pack(pady=(8, 0))
+                 fg="gray").pack(pady=(2, 0))
+
+        # ── Startup progress bar ────────────────────────────────────────────
+        self._progress_var = tk.StringVar(value="")
+        self._progress_label = tk.Label(
+            root, textvariable=self._progress_var,
+            font=("Consolas", 9), fg="#dcdcaa"
+        )
+        self._progress_label.pack()
+        self._startup_step = 0
+        self._startup_steps = [
+            "Exit Node",
+            "Middle Node",
+            "Entry Node",
+            "SOCKS5 прокси",
+            "HTTP прокси",
+        ]
 
         # ── Pool indicator ──────────────────────────────────────────────────
         self._relay_pool_var  = tk.StringVar(value="Relay pool: —")
@@ -424,14 +475,14 @@ class Launcher:
         self.start_btn.pack(side="left", padx=6)
 
         self.stop_btn = tk.Button(
-            btn_frame, text="■  Stop", width=14, bg="#6c3030", fg="white",
+            btn_frame, text="■  Стоп", width=14, bg="#6c3030", fg="white",
             activebackground="#8b3a3a", relief="flat", command=self.stop,
             state="disabled"
         )
         self.stop_btn.pack(side="left", padx=6)
 
         self.chrome_btn = tk.Button(
-            btn_frame, text="🌐  Open Chrome", width=16, bg="#2d5a1b", fg="white",
+            btn_frame, text="🌐  Chrome", width=14, bg="#2d5a1b", fg="white",
             activebackground="#3a7523", relief="flat", command=self.open_chrome,
             state="disabled"
         )
@@ -448,7 +499,7 @@ class Launcher:
         ).pack(side="left", padx=6)
 
         tk.Button(
-            btn_frame, text="🔀  Split", width=10, bg="#3a3a3a", fg="white",
+            btn_frame, text="🔀  Туннелинг", width=14, bg="#3a3a3a", fg="white",
             activebackground="#555555", relief="flat", command=self.open_split_tunneling
         ).pack(side="left", padx=6)
 
@@ -691,13 +742,14 @@ class Launcher:
     def start(self):
         self.start_btn.config(state="disabled")
         self.stop_btn.config(state="normal")
-        self.status_var.set("Starting…")
+        self.status_var.set("Запуск…")
         self._running = True
         self._relay_pool_var.set("Relay pool: —")
         self._entry_pool_var.set("Entry pool: —")
         self._node1_pool_var.set("Middle pool: —")
         self._bw_var.set("↓ — KB/s  ↑ — KB/s")
-        self._append("[launcher] Starting SecureTunnel…\n", "info")
+        self._progress_var.set("[□□□□□] 0/5 Exit Node…")
+        self._append("[launcher] Запуск SecureTunnel…\n", "info")
 
         # Kill any stale processes still holding node ports from a previous session
         for port in (8765, 8766, 8767, 1080, 1081):
@@ -708,7 +760,7 @@ class Launcher:
         os.environ["AUTH_SECRET"] = secret
         self.log_line("[launcher] AUTH_SECRET loaded.\n", "info")
 
-        # Apply custom ports from settings
+        # Apply custom ports and VPS addresses from settings
         s = _load_settings(BASE)
         if s.get("socks5_port"):
             os.environ["SOCKS5_PORT"] = str(s["socks5_port"])
@@ -720,20 +772,43 @@ class Launcher:
             os.environ["MIDDLE_PORT"] = str(s["middle_port"])
         if s.get("exit_port"):
             os.environ["EXIT_PORT"] = str(s["exit_port"])
+        # Remote mode: apply VPS IP addresses
+        if s.get("mode") == "remote":
+            if s.get("entry_host"):
+                os.environ["ENTRY_HOST"] = s["entry_host"]
+            if s.get("middle_host"):
+                os.environ["MIDDLE_HOST"] = s["middle_host"]
+            if s.get("exit_host"):
+                os.environ["EXIT_HOST"] = s["exit_host"]
+            self.log_line(
+                f"[launcher] Режим: удалённый (Entry={s.get('entry_host')} "
+                f"Middle={s.get('middle_host')} Exit={s.get('exit_host')})\n", "info"
+            )
+        else:
+            self.log_line("[launcher] Режим: локальный (все узлы на этой машине)\n", "info")
 
         if not self._ensure_cert():
             self._set_idle()
             return
 
-        self.log_line("[launcher] Waiting for exit node…\n", "info")
+        self._set_progress(0)
+        self.log_line("[launcher] Ожидание Exit Node…\n", "info")
         exit_proc = self._launch("secure_tunnel.exit_node", "exit",
                                   on_ready=self._on_exit_ready)
         self.procs = [exit_proc]
 
+    def _set_progress(self, step: int):
+        total = len(self._startup_steps)
+        filled = "■" * step
+        empty  = "□" * (total - step)
+        label  = self._startup_steps[step] if step < total else "Готово"
+        self._progress_var.set(f"[{filled}{empty}] {step}/{total} {label}…")
+
     def _on_exit_ready(self):
         if not self._running:
             return
-        self.log_line("[launcher] ✔ Exit node ready — starting node1…\n", "info")
+        self._set_progress(1)
+        self.log_line("[launcher] ✔ Exit Node готов — запуск Middle Node…\n", "info")
         proc = self._launch("secure_tunnel.node1", "node1",
                              on_ready=self._on_node1_ready)
         self.procs.append(proc)
@@ -741,7 +816,8 @@ class Launcher:
     def _on_node1_ready(self):
         if not self._running:
             return
-        self.log_line("[launcher] ✔ Middle node ready — starting entry node…\n", "info")
+        self._set_progress(2)
+        self.log_line("[launcher] ✔ Middle Node готов — запуск Entry Node…\n", "info")
         proc = self._launch("secure_tunnel.entry_node", "client",
                              on_ready=self._on_entry_ready)
         self.procs.append(proc)
@@ -749,7 +825,8 @@ class Launcher:
     def _on_entry_ready(self):
         if not self._running:
             return
-        self.log_line("[launcher] ✔ Entry node ready — starting SOCKS5 proxy…\n", "info")
+        self._set_progress(3)
+        self.log_line("[launcher] ✔ Entry Node готов — запуск SOCKS5 прокси…\n", "info")
         proc = self._launch("secure_tunnel.socks5_proxy", "client",
                              on_ready=self._on_socks5_ready)
         self.procs.append(proc)
@@ -757,7 +834,8 @@ class Launcher:
     def _on_socks5_ready(self):
         if not self._running:
             return
-        self.log_line("[launcher] ✔ Tunnel pool ready — starting HTTP proxy…\n", "info")
+        self._set_progress(4)
+        self.log_line("[launcher] ✔ Пул соединений готов — запуск HTTP прокси…\n", "info")
         proc = self._launch("secure_tunnel.http_proxy", "client",
                              on_ready=self._on_http_ready)
         self.procs.append(proc)
@@ -765,13 +843,18 @@ class Launcher:
     def _on_http_ready(self):
         if not self._running:
             return
-        self.log_line("[launcher] ✅ All systems ready!\n", "info")
-        self.status_var.set("✅ Running")
+        self._progress_var.set("[■■■■■] 5/5 Готово!")
+        self.log_line("[launcher] ✅ Все компоненты готовы!\n", "info")
+        self.log_line("[launcher] ── Настройки прокси ──────────────────────\n", "info")
+        self.log_line("[launcher]   SOCKS5:  127.0.0.1:1080\n", "info")
+        self.log_line("[launcher]   HTTP:    127.0.0.1:8080\n", "info")
+        self.log_line("[launcher] ─────────────────────────────────────────\n", "info")
+        self.status_var.set("✅ Работает")
         self.chrome_btn.config(state="normal")
         self.sysproxy_btn.config(state="normal")
         self._ks_on_tunnel_up()
         self._tray_set(self._tray_icon_running if _HAS_TRAY else None,
-                       "SecureTunnel — Running")
+                       "SecureTunnel — Работает")
         threading.Thread(target=_toast_notify,
                          args=("SecureTunnel", "Туннель готов к работе ✅"),
                          daemon=True).start()
@@ -813,7 +896,7 @@ class Launcher:
         self.log_line(f"[launcher] ↺ Restarting {module.split('.')[-1]}…\n", "info")
         proc = self._launch(module, tag)
         self.procs.append(proc)
-        self.status_var.set("✅ Running")
+        self.status_var.set("✅ Работает")
 
     # ── Copy log ──────────────────────────────────────────────────────────────
 
@@ -838,46 +921,92 @@ class Launcher:
 
         settings = _load_settings(BASE)
 
-        fields = [
+        # ── Режим: Локальный / Удалённый ────────────────────────────────────
+        mode_var = tk.StringVar(value=settings.get("mode", "local"))
+        mode_frame = tk.Frame(dlg, bg="#252526")
+        mode_frame.grid(row=0, column=0, columnspan=2, padx=10, pady=(8, 2), sticky="w")
+        tk.Label(mode_frame, text="Режим:", bg="#252526", fg="#9cdcfe",
+                 font=("Consolas", 9, "bold")).pack(side="left")
+        tk.Radiobutton(mode_frame, text="Локальный (все узлы здесь)", variable=mode_var,
+                       value="local", bg="#252526", fg="#d4d4d4", selectcolor="#3c3c3c",
+                       font=("Consolas", 9), activebackground="#252526",
+                       activeforeground="white").pack(side="left", padx=8)
+        tk.Radiobutton(mode_frame, text="Удалённый (VPS серверы)", variable=mode_var,
+                       value="remote", bg="#252526", fg="#d4d4d4", selectcolor="#3c3c3c",
+                       font=("Consolas", 9), activebackground="#252526",
+                       activeforeground="white").pack(side="left", padx=4)
+
+        # ── Порты ────────────────────────────────────────────────────────────
+        tk.Label(dlg, text="── Локальные порты ──", bg="#252526", fg="#569cd6",
+                 font=("Consolas", 9)).grid(row=1, column=0, columnspan=2, pady=(6, 2))
+
+        port_fields = [
             ("SOCKS5 порт",   "socks5_port",  str(settings.get("socks5_port", 1080))),
-            ("HTTP порт",     "http_port",    str(settings.get("http_port",   1081))),
+            ("HTTP порт",     "http_port",    str(settings.get("http_port",   8080))),
             ("Entry порт",    "entry_port",   str(settings.get("entry_port",  8765))),
             ("Middle порт",   "middle_port",  str(settings.get("middle_port", 8766))),
             ("Exit порт",     "exit_port",    str(settings.get("exit_port",   8767))),
         ]
 
         entries = {}
-        for row, (label, key, default) in enumerate(fields):
+        for i, (label, key, default) in enumerate(port_fields):
+            row = i + 2
             tk.Label(dlg, text=label, bg="#252526", fg="#d4d4d4",
                      font=("Consolas", 9), anchor="w", width=16).grid(
-                row=row, column=0, padx=10, pady=4, sticky="w")
+                row=row, column=0, padx=10, pady=3, sticky="w")
             var = tk.StringVar(value=default)
             e = tk.Entry(dlg, textvariable=var, width=8, bg="#3c3c3c", fg="white",
                          insertbackground="white", relief="flat",
                          font=("Consolas", 9))
-            e.grid(row=row, column=1, padx=10, pady=4)
+            e.grid(row=row, column=1, padx=10, pady=3, sticky="w")
+            entries[key] = var
+
+        # ── VPS адреса (только в Remote режиме) ──────────────────────────────
+        tk.Label(dlg, text="── VPS адреса (Remote режим) ──", bg="#252526", fg="#569cd6",
+                 font=("Consolas", 9)).grid(row=7, column=0, columnspan=2, pady=(8, 2))
+
+        vps_fields = [
+            ("Entry IP",    "entry_host",   settings.get("entry_host",  "127.0.0.1")),
+            ("Middle IP",   "middle_host",  settings.get("middle_host", "127.0.0.1")),
+            ("Exit IP",     "exit_host",    settings.get("exit_host",   "127.0.0.1")),
+        ]
+        for i, (label, key, default) in enumerate(vps_fields):
+            row = i + 8
+            tk.Label(dlg, text=label, bg="#252526", fg="#d4d4d4",
+                     font=("Consolas", 9), anchor="w", width=16).grid(
+                row=row, column=0, padx=10, pady=3, sticky="w")
+            var = tk.StringVar(value=default)
+            tk.Entry(dlg, textvariable=var, width=18, bg="#3c3c3c", fg="white",
+                     insertbackground="white", relief="flat",
+                     font=("Consolas", 9)).grid(row=row, column=1, padx=10, pady=3, sticky="w")
             entries[key] = var
 
         def save():
-            new = {}
+            new = {"mode": mode_var.get()}
+            port_keys = {f[1] for f in port_fields}
             for key, var in entries.items():
-                try:
-                    val = int(var.get())
-                    if not (1 <= val <= 65535):
-                        raise ValueError
-                    new[key] = val
-                except ValueError:
-                    self.log_line(f"[launcher] Неверный порт для {key}.\n", "err")
-                    return
+                if key in port_keys:
+                    try:
+                        val = int(var.get())
+                        if not (1 <= val <= 65535):
+                            raise ValueError
+                        new[key] = val
+                    except ValueError:
+                        self.log_line(f"[launcher] Неверный порт для {key}.\n", "err")
+                        return
+                else:
+                    new[key] = var.get().strip()
             _save_settings(BASE, new)
             self.log_line("[launcher] Настройки сохранены. Применятся при следующем запуске.\n", "info")
             dlg.destroy()
 
         def reset():
-            defaults = {"socks5_port": 1080, "http_port": 1081,
-                        "entry_port": 8765, "middle_port": 8766, "exit_port": 8767}
+            mode_var.set("local")
+            defaults = {"socks5_port": 1080, "http_port": 8080,
+                        "entry_port": 8765, "middle_port": 8766, "exit_port": 8767,
+                        "entry_host": "127.0.0.1", "middle_host": "127.0.0.1", "exit_host": "127.0.0.1"}
             for key, var in entries.items():
-                var.set(str(defaults[key]))
+                var.set(str(defaults.get(key, "")))
 
         btn_frame = tk.Frame(dlg, bg="#252526")
         btn_frame.grid(row=len(fields), column=0, columnspan=2, pady=8)
@@ -1100,7 +1229,7 @@ class Launcher:
 
     def stop(self):
         self._running = False
-        self._append("[launcher] Stopping all processes…\n", "info")
+        self._append("[launcher] Остановка процессов…\n", "info")
         for p in self.procs:
             try:
                 p.terminate()
@@ -1120,11 +1249,12 @@ class Launcher:
         if self._ks_on:
             self._ks_remove()
         self._tray_set(self._tray_icon_idle if _HAS_TRAY else None,
-                       "SecureTunnel — Idle")
+                       "SecureTunnel — Ожидание")
         self._relay_pool_var.set("Relay pool: —")
         self._entry_pool_var.set("Entry pool: —")
         self._node1_pool_var.set("Middle pool: —")
         self._bw_var.set("↓ — KB/s  ↑ — KB/s")
+        self._progress_var.set("")
         if self._tproxy_available:
             self._tproxy_on = False
             self._tproxy_label.set("⚪  Прозрачный прокси: ВЫКЛ")
@@ -1132,7 +1262,7 @@ class Launcher:
         self._set_idle()
 
     def _set_idle(self):
-        self.status_var.set("Idle")
+        self.status_var.set("Ожидание")
         self.start_btn.config(state="normal")
         self.stop_btn.config(state="disabled")
         self.chrome_btn.config(state="disabled")
@@ -1171,7 +1301,7 @@ class Launcher:
         self._tray = pystray.Icon(
             "SecureTunnel",
             self._tray_icon_idle,
-            "SecureTunnel — Idle",
+            "SecureTunnel — Ожидание",
             menu,
         )
         t = threading.Thread(target=self._tray.run, daemon=True)

@@ -52,6 +52,24 @@ RATE_LIMIT_PER_MIN: int = int(os.environ.get("RATE_LIMIT", "30"))
 # Seconds to wait for inner-TLS ClientHello before sending decoy
 PROBE_TIMEOUT: float = float(os.environ.get("PROBE_TIMEOUT", "4.0"))
 
+# ── Connection pool ───────────────────────────────────────────────────────────
+# Number of pre-established connections in each pool (relay, entry, middle).
+POOL_SIZE: int = int(os.environ.get("POOL_SIZE", "12"))
+# Max simultaneous fresh connections being established at once.
+POOL_SEMAPHORE: int = int(os.environ.get("POOL_SEMAPHORE", "10"))
+
+# ── Timeouts ──────────────────────────────────────────────────────────────────
+# Timeout for CONNECT through relay → exit (seconds).
+CONNECT_TIMEOUT: float = float(os.environ.get("CONNECT_TIMEOUT", "15"))
+# Timeout for SOCKS5 → HTTP proxy connection (seconds).
+SOCKS5_TIMEOUT: float = float(os.environ.get("SOCKS5_TIMEOUT", "30"))
+# Read buffer size (bytes).
+READ_BUFFER: int = int(os.environ.get("READ_BUFFER", "65536"))
+# Pause writer when pending bytes exceed this threshold (bytes).
+DRAIN_THRESHOLD: int = int(os.environ.get("DRAIN_THRESHOLD", "131072"))
+# Restart crashed component after this delay (seconds).
+RESTART_DELAY: float = float(os.environ.get("RESTART_DELAY", "2.0"))
+
 # ── Circuit rotation ──────────────────────────────────────────────────────────
 # Rotate (replace all tunnel connections) every N seconds OR M requests.
 CIRCUIT_TTL_SECONDS:   int = int(os.environ.get("CIRCUIT_TTL",  "300"))   # 5 min

@@ -470,7 +470,7 @@ pyinstaller installer/SecureTunnel.spec
 
 ## 13. Версии
 
-### v1.1.0
+### v4.1.0
 - Kill Switch (блокировка трафика через Windows Firewall)
 - Системный трей (сворачивание в трей)
 - Индикатор скорости (↓/↑ KB/s)
@@ -483,7 +483,7 @@ pyinstaller installer/SecureTunnel.spec
 - Чистые логи (без Python warnings)
 - Единый `.exe` файл (PyInstaller)
 
-### v1.0.0
+### v4.0.0
 - Базовая 3-узловая архитектура
 - SOCKS5 + HTTP прокси
 - TLS-in-TLS + X25519 + ML-KEM

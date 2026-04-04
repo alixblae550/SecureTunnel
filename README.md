@@ -302,42 +302,13 @@ chrome --proxy-server="socks5://127.0.0.1:1080"
 | Авто-перезапуск при падении | Через 2 сек |
 | Запуск всей цепочки (.exe) | Без ошибок |
 
-### 7.2 Исправленные проблемы
-
-| # | Проблема | Серьёзность | Статус |
-|---|----------|-------------|--------|
-| 1 | Cover-фреймы: случайные байты вместо msgpack → крэш туннеля | Критическая | Исправлено |
-| 2 | exit_node не обрабатывал cover-фреймы | Критическая | Исправлено |
-| 3 | circuit.py: неверная логика guard ротации | Критическая | Исправлено |
-| 4 | exit_node.py: отсутствовал import socket → NameError при UDP | Критическая | Исправлено |
-| 5 | framing.py: отрицательный pad_len при payload > 16384 байт | Высокая | Исправлено |
-| 6 | anti_probing.py: небезопасный доступ к приватным атрибутам writer | Высокая | Исправлено |
-| 7 | Python 3.14: RuntimeError: coroutine ignored GeneratorExit | Высокая | Исправлено |
-| 8 | Task was destroyed but it is pending! — pump_task не ждал отмены | Высокая | Исправлено |
-| 9 | Stdout buffering в frozen .exe — сигналы готовности не доходили | Высокая | Исправлено |
-| 10 | OSError 10048 на прокси — отсутствовал reuse_address=True | Средняя | Исправлено |
-| 11 | Шумные Python warnings в UI (pyimod02_importers.py:457) | Средняя | Исправлено |
-| 12 | asyncio.ensure_future → asyncio.create_task во всех узлах | Низкая | Исправлено |
-
-### 7.3 Латентность
+### 7.2 Латентность
 
 | Метрика | Значение |
 |---------|----------|
 | Средняя задержка (прогретый пул) | ~300–350 мс |
 | Первый запрос (холодный старт) | ~600–700 мс |
 | Время запуска всей цепочки | ~35–45 сек (прогрев 3 пулов × 20 соединений) |
-
-### 7.4 Стресс-тест
-
-| Тест | Результат | Метрика |
-|------|-----------|---------|
-| Параллельная криптография | Успех | 10 000 оп за 0.38с — 26 000 оп/с |
-| Пропускная способность | Успех | 50 МБ за 0.43с — 116 МБ/с ¹ |
-| Rate limiter (1000 IP) | Успех | 5 000 запросов заблокировано корректно |
-| Protocol firehose | Успех | 10 000 фреймов за 0.19с — 53 000/с |
-| Bucket boundaries | Успех | Точное попадание для всех 12 размеров |
-
-> ¹ Измерено на локальном loopback (все узлы на одной машине). Реальная скорость через VPS зависит от сети и составляет 5–50 МБ/с.
 
 ---
 
@@ -418,77 +389,7 @@ chrome --proxy-server="socks5://127.0.0.1:1080"
 
 ---
 
-## 11. Файловая структура
-
-```
-secure_tunnel/
-├── launcher.py                      # Графический лаунчер (GUI)
-├── secure_tunnel/
-│   ├── config.py                    # Конфигурация: узлы, SNI_POOL, бакеты, AUTH_SECRET
-│   ├── exit_node.py                 # Выходной узел (K3) — TCP + UDP, DoH, IPv6
-│   ├── node1.py                     # Промежуточный узел / Middle (K2↔K3)
-│   ├── entry_node.py                # Входной узел (K1↔K2)
-│   ├── tunnel_relay.py              # Relay + пул + circuit + синусоидальный cover + bw
-│   ├── circuit.py                   # Ротация цепочки (TTL + request count)
-│   ├── anti_probing.py              # Anti-probing 2.0: real-site proxy, rate limit, HMAC
-│   ├── socks5_proxy.py              # SOCKS5-прокси :1080 (TCP + UDP ASSOCIATE)
-│   ├── http_proxy.py                # HTTP CONNECT прокси :8080
-│   ├── doh_resolver.py              # DoH DNS-резолвер (TTL-кеш, дедупликация, IPv6)
-│   ├── crypto.py                    # Hybrid KEM: X25519 + ML-KEM-768 + AES-256-GCM-SIV
-│   ├── framing.py                   # Фреймирование + bucket padding (12 размеров)
-│   ├── keyring.py                   # Загрузка/генерация ключей узлов
-│   ├── protocol.py                  # Протокол сообщений (MSG_DATA, MSG_COVER, ReplayFilter)
-│   ├── key_exchange.py              # HybridKeyExchange: X25519 + ML-KEM-768
-│   ├── onion_client.py              # 3-хоповый onion-клиент (EXTEND K1/K2/K3)
-│   ├── onion.py                     # Обёртка onion-маршрутизации
-│   ├── ui/
-│   │   ├── toast.py                 # Windows-уведомления (Win32 Shell_NotifyIconW)
-│   │   ├── kill_switch.py           # Kill Switch (netsh advfirewall)
-│   │   └── settings_dialog.py      # Диалог настроек (tkinter)
-│   └── transport/
-│       └── tls_in_tls_transport.py  # TLS-in-TLS + Chrome fingerprint + SNI ротация
-├── tests/
-│   ├── test_crypto.py               # HKDF, ML-KEM roundtrip
-│   ├── test_framing.py              # Bucket padding, шифрование
-│   ├── test_auth.py                 # HMAC challenge/response, rate limiting
-│   └── test_key_exchange.py         # X25519, HybridKeyExchange, ReplayFilter
-├── SECURITY_AUDIT.md                # Полный отчёт аудита безопасности
-└── installer/
-    └── SecureTunnel.spec            # PyInstaller сборка
-```
-
----
-
-## 12. Тесты
-
-```bash
-pip install pytest
-python -m pytest tests/ -v
-```
-
-Результат: **43 passed, 4 skipped** (ML-KEM тесты пропускаются если OpenSSL < 3.5 — норма).
-
-| Файл | Что тестирует |
-|------|---------------|
-| `tests/test_crypto.py` | X25519 key derivation, ML-KEM roundtrip, HKDF детерминизм |
-| `tests/test_framing.py` | Bucket padding, шифрование/расшифровка, oversized frames |
-| `tests/test_auth.py` | HMAC challenge/response, rate limiting по IP |
-| `tests/test_key_exchange.py` | X25519, HybridKeyExchange roundtrip, ReplayFilter |
-
-Полный отчёт аудита безопасности: [SECURITY_AUDIT.md](SECURITY_AUDIT.md)
-
----
-
-## 13. Сборка .exe (для разработчиков)
-
-```bash
-pip install pyinstaller pillow pystray cryptography msgpack keyring
-pyinstaller installer/SecureTunnel.spec
-```
-
-Результат: `dist/SecureTunnel.exe`
-
-### Развёртывание на серверах
+## 11. Развёртывание на серверах
 
 Для полноценной анонимизации запусти каждый узел на отдельном VPS:
 
@@ -515,22 +416,17 @@ pyinstaller installer/SecureTunnel.spec
 ## 13. Версии
 
 ### v4.4.0
-- **Аудит безопасности** — устранены все критические и высокие уязвимости
-- AUTH_SECRET: автогенерация в local-режиме; `sys.exit(1)` в production если не задан
-- Шифрование: ChaCha20-Poly1305 → **AES-256-GCM-SIV** (nonce-misuse-resistant)
-- ReplayFilter интегрирован во все узлы; каждый фрейм несёт инкрементальный `seq_no`
-- POOL_SIZE ограничен (1–100); UDP-ретрансляция ограничена 64 задачами
-- Все host:port назначений удалены из логов (приватность)
-- Добавлены тесты: `test_auth.py`, `test_key_exchange.py` — итого 46 тестов
-- Добавлен `SECURITY_AUDIT.md` с полным отчётом
+- Полный аудит безопасности — устранены все выявленные уязвимости
+- Улучшенное шифрование с защитой от повторного использования ключевого материала
+- Усиленная защита от replay-атак на всех узлах
+- Hardening пула соединений и UDP-ретрансляции
+- Логи не содержат адресов назначения (приватность)
 
 ### v4.3.0
-- **Настоящий onion-routing** (Tor-стиль): клиент самостоятельно вырабатывает K1/K2/K3 через протокол EXTEND
-- `key_exchange.py` переписан: реальный `HybridKeyExchange` (X25519 + ML-KEM-768)
-- `onion_client.py` переписан: полноценный 3-хоповый onion-клиент
-- Добавлены обработчики EXTEND_K2 / EXTEND_K3 в entry, node1, exit
-- UI: нативные Windows toast-уведомления, Kill Switch, диалог настроек — вынесены в `secure_tunnel/ui/`
-- Все `print()` с адресами заменены на `log_event()` (анонимное логирование)
+- Настоящий onion-routing: каждый хоп использует независимый сеансовый ключ
+- Улучшенный постквантовый обмен ключами
+- UI: нативные Windows-уведомления, Kill Switch, диалог настроек
+- Анонимизированное логирование
 
 ### v4.2.0
 - Прогресс-бар при запуске `[■■□□□] 2/5 Middle Node…`

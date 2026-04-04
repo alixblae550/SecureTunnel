@@ -41,3 +41,6 @@ desktop.ini
 
 # Logs
 *.log
+
+# Auth secret — unique per install
+auth_secret.key

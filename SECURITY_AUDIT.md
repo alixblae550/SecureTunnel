@@ -1,15 +1,15 @@
-# SecureTunnel Security Audit — v4.4.0
+# SecureTunnel — Аудит безопасности v4.4.0
 
-**Audit team:** Principal Engineer · Staff Security Engineer · Network Protocol Engineer · SRE · Performance Engineer · Reverse Engineer · Adversarial Tester  
-**Audit date:** 2026-04-04  
-**Scope:** Full codebase review — architecture, cryptography, protocol, traffic analysis, anti-DPI, operational security
+**Команда аудита:** Principal Engineer · Staff Security Engineer · Network Protocol Engineer · SRE · Performance Engineer · Reverse Engineer · Adversarial Tester  
+**Дата аудита:** 2026-04-04  
+**Область:** Полный обзор кодовой базы — архитектура, криптография, протокол, анализ трафика, защита от DPI, операционная безопасность
 
 ---
 
-## 1. Architecture Overview
+## 1. Обзор архитектуры
 
 ```
-Browser/App
+Браузер / Приложение
     │ SOCKS5 / HTTP CONNECT (127.0.0.1:1080 / :8080)
     ▼
 Relay (tunnel_relay.py)  ──K1 (X25519+ML-KEM)──► Entry (entry_node.py)
@@ -22,108 +22,104 @@ Relay (tunnel_relay.py)  ──K1 (X25519+ML-KEM)──► Entry (entry_node.py)
                                                       │
                                                Exit (exit_node.py)
                                                       │
-                                               DoH resolver
+                                               DoH-резолвер
                                                       │
-                                               Internet
+                                               Интернет
 ```
 
-Each hop is an independent TLS-in-TLS channel with its own hybrid key exchange. The relay derives K1, K2, K3 independently via Tor-style EXTEND commands. No single node can read both source and destination.
+Каждый хоп — независимый TLS-in-TLS канал со своим гибридным обменом ключей. Relay вырабатывает K1, K2, K3 независимо через Tor-стиль команды EXTEND. Ни один узел не может связать источник с назначением.
 
 ---
 
-## 2. Findings Summary
+## 2. Сводная таблица находок
 
-| ID | Severity | Title | Status |
-|----|----------|-------|--------|
-| F-01 | CRITICAL | Hardcoded AUTH_SECRET default | **FIXED v4.3.0** |
-| F-02 | HIGH | HTTP proxy port mismatch (1081 vs 8080) | **FIXED v4.3.0** |
-| F-03 | HIGH | Privacy leak: host:port logged in plaintext | **FIXED v4.3.0** |
-| F-04 | MEDIUM | ChaCha20-Poly1305 nonce reuse risk | **FIXED v4.3.0** |
-| F-05 | MEDIUM | Sequence number replay protection not integrated | **FIXED v4.4.0** |
-| F-06 | MEDIUM | Pool size unbounded — resource exhaustion possible | **FIXED v4.4.0** |
-| F-07 | MEDIUM | UDP relay: unbounded concurrent task count | **FIXED v4.4.0** |
-| F-08 | LOW | onion_client.py / key_exchange.py were dead code | **FIXED v4.3.0** |
-| F-09 | INFO | ML-KEM requires OpenSSL 3.5; falls back silently | Accepted — logged |
-| F-10 | INFO | ECH not yet available in Python ssl/OpenSSL bindings | Deferred — documented |
-
----
-
-## 3. Detailed Findings
-
-### F-01 — CRITICAL: Hardcoded AUTH_SECRET
-
-**File:** `secure_tunnel/config.py`
-
-**Description:** The original code used a hardcoded string `"securetunnel-default-secret-CHANGE-ME"` as the AUTH_SECRET when the environment variable was not set. Any two installations with the same binary would share the same secret, allowing an adversary who obtained the binary to authenticate to all nodes.
-
-**Fix:** The config module now:
-- In **local mode** (all nodes on 127.0.0.1): auto-generates a cryptographically random 32-byte hex secret on first run and persists it to `auth_secret.key` (gitignored).
-- In **production mode** (any remote node): calls `sys.exit(1)` with a clear error message if `AUTH_SECRET` is not set.
-
-```python
-POOL_SIZE: int = max(1, min(100, int(os.environ.get("POOL_SIZE", "12"))))
-```
+| ID | Серьёзность | Название | Статус |
+|----|-------------|----------|--------|
+| F-01 | КРИТИЧЕСКАЯ | Захардкоженный AUTH_SECRET по умолчанию | **ИСПРАВЛЕНО v4.3.0** |
+| F-02 | ВЫСОКАЯ | Несоответствие порта HTTP-прокси (1081 vs 8080) | **ИСПРАВЛЕНО v4.3.0** |
+| F-03 | ВЫСОКАЯ | Утечка приватности: host:port в логах открытым текстом | **ИСПРАВЛЕНО v4.3.0** |
+| F-04 | СРЕДНЯЯ | Риск повторного использования nonce в ChaCha20-Poly1305 | **ИСПРАВЛЕНО v4.3.0** |
+| F-05 | СРЕДНЯЯ | ReplayFilter не был интегрирован | **ИСПРАВЛЕНО v4.4.0** |
+| F-06 | СРЕДНЯЯ | Неограниченный размер пула — возможно исчерпание ресурсов | **ИСПРАВЛЕНО v4.4.0** |
+| F-07 | СРЕДНЯЯ | UDP-ретрансляция: неограниченное число одновременных задач | **ИСПРАВЛЕНО v4.4.0** |
+| F-08 | НИЗКАЯ | onion_client.py / key_exchange.py были мёртвым кодом | **ИСПРАВЛЕНО v4.3.0** |
+| F-09 | ИНФО | ML-KEM требует OpenSSL 3.5; тихий откат на X25519 | Принято — логируется |
+| F-10 | ИНФО | ECH недоступен в Python ssl / OpenSSL-биндингах | Отложено — задокументировано |
 
 ---
 
-### F-02 — HIGH: HTTP Proxy Port Mismatch
+## 3. Детальное описание находок
 
-**Files:** `secure_tunnel/http_proxy.py`, `launcher.py`
+### F-01 — КРИТИЧЕСКАЯ: Захардкоженный AUTH_SECRET
 
-**Description:** `http_proxy.py` hardcoded port 1081 while the launcher UI showed 8080 as the HTTP proxy port. Users were configuring their browsers for 8080 but no proxy was listening there.
+**Файл:** `secure_tunnel/config.py`
 
-**Fix:** `http_proxy.py` now reads `HTTP_PORT` env var (default 8080). Launcher's `PROXY_ADDR` and kill-switch loop also corrected to 8080.
+**Описание:** Оригинальный код использовал захардкоженную строку `"securetunnel-default-secret-CHANGE-ME"` в качестве AUTH_SECRET, если переменная окружения не была задана. Любые два экземпляра с одинаковым бинарником разделяли бы один и тот же секрет — злоумышленник, получивший `.exe`, мог бы аутентифицироваться на всех узлах.
 
----
-
-### F-03 — HIGH: Privacy Leak in Logs
-
-**Files:** `secure_tunnel/socks5_proxy.py`, `secure_tunnel/exit_node.py`
-
-**Description:** Multiple `print()` calls logged real destination host:port pairs and client peer IPs to stdout. In a forensic scenario, these log lines would expose browsing destinations.
-
-**Fix:** All privacy-sensitive prints replaced with `log_event()` which logs only metadata (bytes, event type, session ID). Destination addresses never appear in logs.
+**Исправление:** Модуль `config.py` теперь:
+- В **локальном режиме** (все узлы на 127.0.0.1): автогенерирует криптографически случайный 32-байтный hex-секрет при первом запуске и сохраняет в `auth_secret.key` (добавлен в `.gitignore`).
+- В **production-режиме** (хоть один удалённый узел): вызывает `sys.exit(1)` с понятным сообщением об ошибке, если `AUTH_SECRET` не задан.
 
 ---
 
-### F-04 — MEDIUM: ChaCha20-Poly1305 Nonce Reuse Risk
+### F-02 — ВЫСОКАЯ: Несоответствие порта HTTP-прокси
 
-**File:** `secure_tunnel/crypto.py`
+**Файлы:** `secure_tunnel/http_proxy.py`, `launcher.py`
 
-**Description:** The original implementation used ChaCha20-Poly1305 with random 96-bit nonces. With a birthday bound of ~2^48 frames, nonce collision probability reaches 0.1% after ~2^43 frames — a real risk for long-lived high-throughput sessions. A nonce collision in ChaCha20-Poly1305 catastrophically exposes the keystream.
+**Описание:** `http_proxy.py` содержал захардкоженный порт 1081, в то время как UI лаунчера показывал 8080 как порт HTTP-прокси. Пользователи настраивали браузеры на 8080, но прокси там не слушал.
 
-**Fix:** Switched to **AES-256-GCM-SIV** (nonce-misuse-resistant). Even if a nonce is accidentally reused, SIV construction only reveals that identical plaintext was sent twice — the session key and all other plaintexts remain secure. This is a strictly stronger guarantee.
+**Исправление:** `http_proxy.py` теперь читает переменную `HTTP_PORT` (по умолчанию 8080). `PROXY_ADDR` в лаунчере и цикл kill-switch также исправлены на 8080.
+
+---
+
+### F-03 — ВЫСОКАЯ: Утечка приватности в логах
+
+**Файлы:** `secure_tunnel/socks5_proxy.py`, `secure_tunnel/exit_node.py`
+
+**Описание:** Множество вызовов `print()` выводили реальные пары host:port назначения и IP-адреса клиентов в stdout. При форензике эти строки раскрывали бы историю посещений.
+
+**Исправление:** Все privacy-чувствительные print() заменены на `log_event()`, который логирует только метаданные (байты, тип события, session ID). Адреса назначения больше не попадают в логи.
+
+---
+
+### F-04 — СРЕДНЯЯ: Риск повторного nonce в ChaCha20-Poly1305
+
+**Файл:** `secure_tunnel/crypto.py`
+
+**Описание:** Оригинальная реализация использовала ChaCha20-Poly1305 со случайными 96-битными nonce. С учётом birthday-bound ~2^48 фреймов вероятность коллизии nonce достигает 0.1% после ~2^43 фреймов — реальный риск для долгоживущих высоконагруженных сессий. Коллизия nonce в ChaCha20-Poly1305 катастрофически раскрывает keystream.
+
+**Исправление:** Переход на **AES-256-GCM-SIV** (nonce-misuse-resistant). Даже при случайном повторе nonce SIV-конструкция раскрывает лишь факт отправки одинакового открытого текста дважды — сессионный ключ и все остальные сообщения остаются защищёнными.
 
 ```python
 from cryptography.hazmat.primitives.ciphers.aead import AESGCMSIV
 _NONCE_LEN = 12
 ```
 
-Note: XChaCha20-Poly1305 (192-bit nonce, no birthday risk) was the first choice but is not exposed in `cryptography` 46.x. AES-GCM-SIV is equivalent security with a practical nonce-misuse-resistance bonus.
+Примечание: XChaCha20-Poly1305 (192-битный nonce, без birthday-риска) был первым выбором, но не доступен в `cryptography` 46.x. AES-GCM-SIV — эквивалентная безопасность с дополнительной гарантией устойчивости к повтору nonce.
 
 ---
 
-### F-05 — MEDIUM: Replay Protection Not Integrated
+### F-05 — СРЕДНЯЯ: ReplayFilter не был интегрирован
 
-**Files:** `secure_tunnel/protocol.py`, `secure_tunnel/tunnel_relay.py`, `secure_tunnel/entry_node.py`, `secure_tunnel/node1.py`, `secure_tunnel/exit_node.py`
+**Файлы:** `secure_tunnel/protocol.py`, `secure_tunnel/tunnel_relay.py`, `secure_tunnel/entry_node.py`, `secure_tunnel/node1.py`, `secure_tunnel/exit_node.py`
 
-**Description:** The `ReplayFilter` class existed in `protocol.py` but was never called anywhere. All frames used `seq_no=0`. An adversary who could record and replay a valid AES-GCM-SIV ciphertext (same nonce+tag) would have it accepted as legitimate by the receiving node.
+**Описание:** Класс `ReplayFilter` существовал в `protocol.py`, но нигде не вызывался. Все фреймы использовали `seq_no=0`. Злоумышленник, записавший и воспроизведший валидный AES-GCM-SIV шифртекст (тот же nonce+tag), мог бы заставить принимающий узел обработать его как легитимный.
 
-**Fix (v4.4.0):**
-1. `tunnel_relay.py` — `_make_cmd_helpers` now maintains a per-connection outbound `_seq_out` counter and an inbound `ReplayFilter`. Outgoing frames carry incrementing seq_no; incoming frames are validated.
-2. `exit_node.py` — Added outbound seq counter and inbound `ReplayFilter` in the per-connection `_send_cmd`/`_parse_cmd` closures.
-3. `entry_node.py` — Added `relay_replay = ReplayFilter()` validated on every inbound relay frame (both EXTEND phase and forward loop).
-4. `node1.py` — Added `entry_replay = ReplayFilter()` validated on every inbound entry frame.
+**Исправление (v4.4.0):**
+1. `tunnel_relay.py` — `_make_cmd_helpers` теперь ведёт исходящий счётчик `_seq_out` и входящий `ReplayFilter`. Исходящие фреймы несут инкрементальный seq_no; входящие валидируются.
+2. `exit_node.py` — Добавлены счётчик и фильтр в замыканиях `_send_cmd` / `_parse_cmd`.
+3. `entry_node.py` — Добавлен `relay_replay = ReplayFilter()` — проверка на каждый входящий фрейм (фаза EXTEND и основной цикл).
+4. `node1.py` — Добавлен `entry_replay = ReplayFilter()` — проверка на каждый входящий фрейм.
 
 ---
 
-### F-06 — MEDIUM: Unbounded Pool Size
+### F-06 — СРЕДНЯЯ: Неограниченный размер пула
 
-**File:** `secure_tunnel/config.py`
+**Файл:** `secure_tunnel/config.py`
 
-**Description:** `POOL_SIZE = int(os.environ.get("POOL_SIZE", "12"))` with no upper bound. Setting `POOL_SIZE=100000` would exhaust file descriptors and memory.
+**Описание:** `POOL_SIZE = int(os.environ.get("POOL_SIZE", "12"))` без верхней границы. Установка `POOL_SIZE=100000` исчерпала бы файловые дескрипторы и память.
 
-**Fix:**
+**Исправление:**
 ```python
 POOL_SIZE: int = max(1, min(100, int(os.environ.get("POOL_SIZE", "12"))))
 POOL_SEMAPHORE: int = max(1, min(50, int(os.environ.get("POOL_SEMAPHORE", "10"))))
@@ -131,13 +127,13 @@ POOL_SEMAPHORE: int = max(1, min(50, int(os.environ.get("POOL_SEMAPHORE", "10"))
 
 ---
 
-### F-07 — MEDIUM: UDP Relay Task Flood
+### F-07 — СРЕДНЯЯ: UDP flood без ограничений
 
-**File:** `secure_tunnel/socks5_proxy.py`
+**Файл:** `secure_tunnel/socks5_proxy.py`
 
-**Description:** `_UDPRelay.datagram_received()` called `asyncio.ensure_future()` unconditionally for every incoming datagram. A UDP flood of 10,000 datagrams/s would spawn 10,000 concurrent coroutines, exhausting memory and event loop capacity.
+**Описание:** `_UDPRelay.datagram_received()` безусловно вызывал `asyncio.ensure_future()` для каждой входящей датаграммы. UDP-флуд в 10 000 датаграмм/сек породил бы 10 000 одновременных корутин, исчерпав память и ёмкость event loop.
 
-**Fix:** Added `_active_tasks` counter capped at `_MAX_UDP_TASKS = 64`. Excess datagrams are silently dropped (logged as `udp_flood_drop`).
+**Исправление:** Добавлен счётчик `_active_tasks`, ограниченный `_MAX_UDP_TASKS = 64`. Избыточные датаграммы тихо сбрасываются (логируются как `udp_flood_drop`).
 
 ```python
 def datagram_received(self, data, addr):
@@ -150,161 +146,161 @@ def datagram_received(self, data, addr):
 
 ---
 
-### F-08 — LOW: Dead Code (onion_client.py, key_exchange.py)
+### F-08 — НИЗКАЯ: Мёртвый код (onion_client.py, key_exchange.py)
 
-**Files:** `secure_tunnel/onion_client.py`, `secure_tunnel/key_exchange.py`
+**Файлы:** `secure_tunnel/onion_client.py`, `secure_tunnel/key_exchange.py`
 
-**Description:** Both files existed in the codebase but were never called. `key_exchange.py` contained a `PQKeyExchangeStub` with XOR "encryption" masquerading as post-quantum crypto.
+**Описание:** Оба файла присутствовали в репозитории, но нигде не вызывались. `key_exchange.py` содержал `PQKeyExchangeStub` с XOR-"шифрованием", выдаваемым за пост-квантовую криптографию.
 
-**Fix (v4.3.0):** Both files were rewritten and connected to the live circuit:
-- `key_exchange.py` — Real `HybridKeyExchange` using `derive_session_key` + ML-KEM-768
-- `onion_client.py` — True 3-hop onion circuit via `EXTEND_K2` / `EXTEND_K3` commands
-
----
-
-## 4. Cryptographic Audit
-
-### Key Exchange
-
-| Layer | Algorithm | Security |
-|-------|-----------|---------|
-| Classical | X25519 ECDH | 128-bit equivalent |
-| Post-quantum | ML-KEM-768 | 192-bit post-quantum |
-| Combination | HKDF-SHA256(x25519_ss \|\| mlkem_ss) | Breakable only if BOTH fail |
-| Fallback | X25519-only (OpenSSL < 3.5) | 128-bit classical |
-
-**Assessment:** Hybrid construction is correct. Concatenation before HKDF ensures the combined key is secure as long as either component is unbroken.
-
-### Payload Encryption
-
-| Property | Value |
-|----------|-------|
-| Algorithm | AES-256-GCM-SIV |
-| Nonce | 96-bit random per frame |
-| Key size | 256 bits |
-| Nonce-misuse resistance | Yes (SIV) |
-| Authentication | GHASH (96-bit tag) |
-
-**Assessment:** Nonce-misuse-resistant AEAD is a strong choice for random nonces. The SIV guarantee prevents catastrophic failure on accidental nonce reuse. Authentication tag size (128 bits after GCM) is standard.
-
-### Replay Protection
-
-- `ReplayFilter` uses a 64-frame sliding window with 32-bit wraparound-safe modular arithmetic.
-- Outbound counters in relay and exit nodes are now incremented per-frame.
-- Entry and middle nodes validate inbound seq_no against per-connection `ReplayFilter` instances.
-
-**Residual gap:** The middle-to-exit direction uses random `secrets.randbits(32)` seq_no (forwarded from entry). A targeted replay on this internal hop would require breaking the outer TLS-in-TLS channel — acceptable risk level.
+**Исправление (v4.3.0):** Оба файла полностью переписаны и подключены к реальной схеме:
+- `key_exchange.py` — настоящий `HybridKeyExchange` через `derive_session_key` + ML-KEM-768
+- `onion_client.py` — полноценный 3-хоповый onion-клиент через команды `EXTEND_K2` / `EXTEND_K3`
 
 ---
 
-## 5. Anti-DPI Analysis
+## 4. Криптографический аудит
 
-### Traffic Fingerprint
+### Обмен ключами
 
-| Property | Technique |
-|----------|-----------|
-| Outer TLS | Chrome-like fingerprint (via OpenSSL SNI pool) |
-| SNI values | Windows Update, NVIDIA telemetry, Google CDN, DigiCert OCSP |
-| Packet sizes | 12-bucket padding (256B–16384B) normalizes size histogram |
-| Timing | Sinusoidal cover traffic (mimics 14:00 activity peak, ±15% jitter) |
-| Idle periods | Cover frames injected so "silence ≠ no activity" |
-| Anti-probing | HMAC challenge inside inner TLS + rate limiting + decoy forward |
+| Слой | Алгоритм | Безопасность |
+|------|----------|--------------|
+| Классический | X25519 ECDH | 128-битный эквивалент |
+| Постквантовый | ML-KEM-768 | 192-битная постквантовая |
+| Комбинация | HKDF-SHA256(x25519_ss \|\| mlkem_ss) | Взламывается только при компрометации ОБОИХ |
+| Откат | Только X25519 (OpenSSL < 3.5) | 128-битная классическая |
 
-### Remaining Fingerprints
+**Оценка:** Гибридная конструкция реализована корректно. Конкатенация перед HKDF гарантирует безопасность совместного ключа, пока хотя бы один из компонентов устойчив.
 
-1. **TLS-in-TLS depth** — Two nested TLS sessions are unusual. Deep packet inspection by a state-level adversary with hardware offload could detect the inner TLS ClientHello inside the outer TLS data.
-   - Mitigation: inner TLS cert should be a self-signed cert with a plausible CN matching the outer SNI.
-   - Future: ECH (Encrypted Client Hello) would solve this once Python `ssl` module exposes it.
+### Шифрование полезной нагрузки
 
-2. **Fixed connection pre-warming** — The POOL_SIZE=12 pre-warmed connections create a distinctive burst of 12 simultaneous TLS handshakes on startup.
-   - Mitigation: stagger pool warming (already done with batch=4 fills).
+| Свойство | Значение |
+|----------|----------|
+| Алгоритм | AES-256-GCM-SIV |
+| Nonce | 96-битный случайный на каждый фрейм |
+| Размер ключа | 256 бит |
+| Устойчивость к повтору nonce | Да (SIV) |
+| Аутентификация | GHASH (96-битный тег) |
 
-3. **Cover traffic rhythm** — Even with sinusoidal variation, a sophisticated ML classifier trained on the sinusoidal pattern could potentially identify the tunnel.
-   - Mitigation: ±15% random jitter breaks regularity; acceptable for current threat model.
+**Оценка:** Nonce-misuse-resistant AEAD — сильный выбор для случайных nonce. SIV-гарантия исключает катастрофический отказ при случайном повторе nonce. Размер тега аутентификации (128 бит после GCM) — стандартный.
 
----
+### Защита от replay-атак
 
-## 6. Red Team Scenarios
+- `ReplayFilter` использует скользящее окно в 64 фрейма с 32-битной модульной арифметикой, корректно обрабатывающей переполнение.
+- Исходящие счётчики в relay и exit теперь инкрементируются на каждый фрейм.
+- Entry и middle узлы валидируют входящий seq_no через per-соединение экземпляры `ReplayFilter`.
 
-### Scenario A: Passive Traffic Analysis
-**Threat:** Observer records all TLS traffic, applies ML classifier to packet sizes and timing.  
-**Resistance:** Bucket padding normalizes sizes to 12 discrete values; sinusoidal cover traffic with jitter prevents timing fingerprinting.  
-**Rating:** Moderate-High resistance.
-
-### Scenario B: Active Probing
-**Threat:** Adversary connects to node ports with a standard TLS client to fingerprint the service.  
-**Resistance:** Outer TLS looks like a web server; nodes forward connections to real CDN/update servers matching the SNI. Without the AUTH_SECRET, the adversary cannot distinguish this from a normal HTTPS server.  
-**Rating:** High resistance.
-
-### Scenario C: Replay Attack
-**Threat:** Adversary records encrypted tunnel frames and replays them to inject commands.  
-**Resistance (post-fix):** AES-GCM-SIV authentication prevents modification. `ReplayFilter` with 64-frame window rejects duplicates. Incrementing `seq_no` prevents same-session replays.  
-**Rating:** High resistance (after v4.4.0 fixes).
-
-### Scenario D: Node Compromise
-**Threat:** Adversary fully compromises one node.  
-**Resistance:** Entry knows relay IP + K1. Middle knows only K2. Exit knows only destination. No single node can link source to destination. K1/K2/K3 are independently derived by the relay client.  
-**Rating:** High resistance (proper onion routing).
-
-### Scenario E: Quantum Adversary
-**Threat:** Future quantum computer breaks X25519.  
-**Resistance (when ML-KEM available):** ML-KEM-768 shared secret is combined with X25519 via HKDF. Quantum computer can break X25519 but not ML-KEM. Session key remains secure.  
-**Resistance (when ML-KEM unavailable):** Falls back to X25519 only — vulnerable to quantum adversary with CRQC.  
-**Rating:** High (with ML-KEM) / Low (without).
+**Остаточный пробел:** В направлении middle→exit seq_no генерируется как `secrets.randbits(32)` (форвардинг от entry). Целевая replay-атака на этот внутренний хоп потребовала бы взлома внешнего TLS-in-TLS канала — приемлемый уровень риска.
 
 ---
 
-## 7. Performance Notes
+## 5. Анализ устойчивости к DPI
 
-- **Pool pre-warming:** 12 connections × 3 TLS handshakes per connection = 36 TLS handshakes on startup. Batched to 4 concurrent.
-- **Cover traffic:** Sinusoidal model adds 3–60s intervals of background traffic proportional to time-of-day.
-- **Jitter:** 5–40ms per frame adds latency. Acceptable for proxy use, noticeable for latency-sensitive apps (gaming, VoIP).
-- **ReplayFilter:** `set` membership check is O(1). Window eviction is O(window_size). No performance concern.
-- **AES-GCM-SIV vs ChaCha20:** On hardware with AES-NI (any modern x86), AES-GCM-SIV is faster than ChaCha20. On ARM without crypto extensions, ChaCha20 would be faster — not a concern for desktop/server deployment.
+### Отпечаток трафика
+
+| Свойство | Техника |
+|----------|---------|
+| Внешний TLS | Chrome-подобный fingerprint (SNI-пул через OpenSSL) |
+| Значения SNI | Windows Update, NVIDIA telemetry, Google CDN, DigiCert OCSP |
+| Размеры пакетов | 12-бакетный padding (256Б–16384Б) нормализует гистограмму |
+| Тайминг | Синусоидальный cover-трафик (пик активности ~14:00, ±15% джиттер) |
+| Периоды простоя | Cover-фреймы инжектируются — "тишина ≠ нет активности" |
+| Защита от зондирования | HMAC-вызов внутри inner TLS + rate limiting + decoy-форвардинг |
+
+### Оставшиеся отпечатки
+
+1. **Глубина TLS-in-TLS** — два вложенных TLS-сеанса нетипичны. Глубокая инспекция пакетов государственным уровнем противника с аппаратной разгрузкой может обнаружить inner TLS ClientHello внутри данных outer TLS.
+   - Митигация: сертификат inner TLS должен быть самоподписанным с CN, соответствующим outer SNI.
+   - Будущее: ECH (Encrypted Client Hello) решит эту проблему, когда Python `ssl` раскроет соответствующий API.
+
+2. **Фиксированный прогрев пула** — 12 предварительно устанавливаемых соединений создают характерный всплеск из 12 одновременных TLS-рукопожатий при запуске.
+   - Митигация: порционное заполнение пула (уже реализовано, batch=4).
+
+3. **Ритм cover-трафика** — даже с синусоидальной вариацией сложный ML-классификатор, обученный на синусоидальном паттерне, потенциально может идентифицировать туннель.
+   - Митигация: ±15% случайный джиттер нарушает периодичность; приемлемо для текущей модели угроз.
 
 ---
 
-## 8. Test Coverage
+## 6. Red Team сценарии
 
-| Test file | Tests | What is covered |
-|-----------|-------|-----------------|
-| `tests/test_crypto.py` | 8 | HKDF derivation, ML-KEM roundtrip |
-| `tests/test_framing.py` | 8 | Bucket padding, parse/build roundtrip, wrong key |
+### Сценарий А: Пассивный анализ трафика
+**Угроза:** Наблюдатель записывает весь TLS-трафик и применяет ML-классификатор к размерам пакетов и таймингу.  
+**Устойчивость:** Bucket padding нормализует размеры до 12 дискретных значений; синусоидальный cover-трафик с джиттером препятствует тайминговому дактилоскопированию.  
+**Оценка:** Средне-высокая устойчивость.
+
+### Сценарий Б: Активное зондирование
+**Угроза:** Злоумышленник подключается к портам узлов стандартным TLS-клиентом для идентификации сервиса.  
+**Устойчивость:** Внешний TLS выглядит как веб-сервер; узлы перенаправляют соединения на реальные CDN/update серверы по совпадающему SNI. Без AUTH_SECRET злоумышленник не отличит это от обычного HTTPS-сервера.  
+**Оценка:** Высокая устойчивость.
+
+### Сценарий В: Replay-атака
+**Угроза:** Злоумышленник записывает зашифрованные фреймы туннеля и воспроизводит их для инъекции команд.  
+**Устойчивость (после исправления):** Аутентификация AES-GCM-SIV предотвращает модификацию. `ReplayFilter` с окном 64 фрейма отклоняет дубликаты. Инкрементальный `seq_no` предотвращает повторы внутри сессии.  
+**Оценка:** Высокая устойчивость (после исправлений v4.4.0).
+
+### Сценарий Г: Компрометация узла
+**Угроза:** Злоумышленник полностью компрометирует один узел.  
+**Устойчивость:** Entry знает IP relay + K1. Middle знает только K2. Exit знает только назначение. Ни один узел не может связать источник с назначением. K1/K2/K3 независимо вырабатываются relay-клиентом.  
+**Оценка:** Высокая устойчивость (настоящая луковая маршрутизация).
+
+### Сценарий Д: Квантовый противник
+**Угроза:** Будущий квантовый компьютер взламывает X25519.  
+**Устойчивость (при доступном ML-KEM):** Общий секрет ML-KEM-768 объединяется с X25519 через HKDF. Квантовый компьютер может взломать X25519, но не ML-KEM. Сессионный ключ остаётся защищённым.  
+**Устойчивость (при недоступном ML-KEM):** Откат на только X25519 — уязвим к квантовому противнику с CRQC.  
+**Оценка:** Высокая (с ML-KEM) / Низкая (без ML-KEM).
+
+---
+
+## 7. Производительность
+
+- **Прогрев пула:** 12 соединений × 3 TLS-рукопожатия = 36 TLS-рукопожатий при запуске. Порциями по 4 одновременно.
+- **Cover-трафик:** Синусоидальная модель добавляет интервалы фоновых фреймов 3–60 сек пропорционально времени суток.
+- **Джиттер:** 5–40 мс на каждый фрейм добавляет задержку. Приемлемо для прокси, заметно для задержкочувствительных приложений (игры, VoIP).
+- **ReplayFilter:** Проверка членства в `set` — O(1). Вытеснение из окна — O(window_size). Без влияния на производительность.
+- **AES-GCM-SIV vs ChaCha20:** На железе с AES-NI (любой современный x86) AES-GCM-SIV быстрее ChaCha20. На ARM без крипто-расширений ChaCha20 был бы быстрее — несущественно для desktop/server развёртывания.
+
+---
+
+## 8. Покрытие тестами
+
+| Файл | Тестов | Что покрывает |
+|------|--------|---------------|
+| `tests/test_crypto.py` | 8 | HKDF-деривация, ML-KEM roundtrip |
+| `tests/test_framing.py` | 8 | Bucket padding, parse/build roundtrip, неверный ключ |
 | `tests/test_auth.py` | 10 | HMAC challenge/response, rate limiting |
 | `tests/test_key_exchange.py` | 20 | X25519, ML-KEM, HybridKeyExchange, ReplayFilter |
-| **Total** | **46** | Core crypto + protocol + auth + rate-limiting |
+| **Итого** | **46** | Ядро крипто + протокол + аутентификация + rate-limiting |
 
-4 tests are skipped when ML-KEM is unavailable (requires OpenSSL 3.5).
+4 теста пропускаются при недоступном ML-KEM (требует OpenSSL 3.5).
 
-Run all tests:
+Запуск всех тестов:
 ```bash
 python -m pytest tests/ -v
 ```
 
 ---
 
-## 9. Operational Security Checklist
+## 9. Чеклист операционной безопасности
 
-Before deploying to VPS nodes, verify:
+Перед развёртыванием на VPS-узлах проверить:
 
-- [ ] `AUTH_SECRET` env var set identically on ALL nodes AND the client machine
-- [ ] `auth_secret.key` is in `.gitignore` and never committed
-- [ ] `cert.pem` / `key.pem` are node-specific, not shared
-- [ ] `secure_tunnel_keys/*.key` are gitignored
-- [ ] Firewall allows only expected port(s) per node
-- [ ] Nodes are in different jurisdictions / autonomous systems
-- [ ] POOL_SIZE tuned for expected load (default 12 is suitable for 1–10 concurrent users)
-- [ ] COVER_SNI matches outer TLS SNI for plausible traffic blending
+- [ ] `AUTH_SECRET` задан одинаково на ВСЕХ узлах И на клиентской машине
+- [ ] `auth_secret.key` в `.gitignore` и никогда не коммитится
+- [ ] `cert.pem` / `key.pem` уникальны для каждого узла, не разделяются
+- [ ] `secure_tunnel_keys/*.key` в `.gitignore`
+- [ ] Файрвол разрешает только ожидаемые порты для каждого узла
+- [ ] Узлы находятся в разных юрисдикциях / автономных системах
+- [ ] POOL_SIZE настроен под ожидаемую нагрузку (12 по умолчанию подходит для 1–10 одновременных пользователей)
+- [ ] COVER_SNI совпадает с outer TLS SNI для правдоподобного смешения трафика
 
 ---
 
-## 10. Fix Roadmap (Future)
+## 10. План дальнейших улучшений
 
-| Priority | Item |
-|----------|------|
-| HIGH | ECH (Encrypted Client Hello) — when Python ssl exposes OpenSSL 3.2+ ECH API |
-| MEDIUM | Middle→exit seq_no tracking (replace `secrets.randbits(32)` with per-connection counter) |
-| MEDIUM | XChaCha20-Poly1305 (192-bit nonce) — when `cryptography` package exposes it |
-| LOW | Tor-style circuit teardown handshake (clean DESTROY cell) |
-| LOW | Multiple circuits per session for load balancing |
-| INFO | Consider obfs4 or Shadowsocks obfuscation layer for highly censored environments |
+| Приоритет | Задача |
+|-----------|--------|
+| ВЫСОКИЙ | ECH (Encrypted Client Hello) — когда Python ssl раскроет API OpenSSL 3.2+ ECH |
+| СРЕДНИЙ | Отслеживание seq_no в направлении middle→exit (заменить `secrets.randbits(32)` на per-соединение счётчик) |
+| СРЕДНИЙ | XChaCha20-Poly1305 (192-битный nonce) — когда пакет `cryptography` раскроет его |
+| НИЗКИЙ | Tor-стиль teardown рукопожатия (чистая DESTROY-ячейка) |
+| НИЗКИЙ | Несколько цепочек на сессию для балансировки нагрузки |
+| ИНФО | Рассмотреть obfs4 или Shadowsocks как слой обфускации для сильно цензурируемых окружений |

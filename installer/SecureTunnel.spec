@@ -67,7 +67,7 @@ a = Analysis(
     ],
     excludes=[
         'matplotlib', 'numpy', 'scipy', 'pandas',
-        'PIL', 'cv2', 'PyQt5', 'wx', 'PySide2',
+        'cv2', 'PyQt5', 'wx', 'PySide2',
         'IPython', 'jupyter', 'notebook',
     ],
     noarchive=False,

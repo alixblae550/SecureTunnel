@@ -247,7 +247,7 @@ def _save_settings(base: Path, settings: dict) -> None:
 
 # ── Auto-update ───────────────────────────────────────────────────────────────
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "4.1.0"
 _GITHUB_REPO = ""   # Set to "owner/repo" to enable auto-update checks
 
 
@@ -289,6 +289,27 @@ def _check_update_bg(callback) -> None:
             pass
 
     threading.Thread(target=_run, daemon=True).start()
+
+
+def _toast_notify(title: str, message: str) -> None:
+    """Show a Windows 10/11 toast notification via PowerShell."""
+    try:
+        script = (
+            f"[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType=WindowsRuntime] | Out-Null;"
+            f"$t = [Windows.UI.Notifications.ToastTemplateType]::ToastText02;"
+            f"$xml = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent($t);"
+            f"$xml.GetElementsByTagName('text')[0].AppendChild($xml.CreateTextNode('{title}')) | Out-Null;"
+            f"$xml.GetElementsByTagName('text')[1].AppendChild($xml.CreateTextNode('{message}')) | Out-Null;"
+            f"$app = 'SecureTunnel';"
+            f"[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($app).Show("
+            f"[Windows.UI.Notifications.ToastNotification]::new($xml))"
+        )
+        subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True, timeout=5
+        )
+    except Exception:
+        pass
 
 
 def _write_proxy_pac(base: Path, domains_raw: str) -> None:
@@ -373,7 +394,7 @@ class Launcher:
 
         tk.Label(
             root,
-            text="SOCKS5: 127.0.0.1:1080  |  HTTP Proxy: 127.0.0.1:1081  |  System proxy toggle below",
+            text="SOCKS5: 127.0.0.1:1080  |  HTTP Proxy: 127.0.0.1:8080  |  System proxy toggle below",
             font=("Consolas", 9), fg="#9cdcfe",
         ).pack()
 
@@ -751,6 +772,9 @@ class Launcher:
         self._ks_on_tunnel_up()
         self._tray_set(self._tray_icon_running if _HAS_TRAY else None,
                        "SecureTunnel — Running")
+        threading.Thread(target=_toast_notify,
+                         args=("SecureTunnel", "Туннель готов к работе ✅"),
+                         daemon=True).start()
         if self._tproxy_available:
             self.tproxy_btn.config(state="normal")
             self.log_line(

